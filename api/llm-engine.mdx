@@ -1,0 +1,312 @@
+---
+title: "LLMEngine"
+description: "High-level engine that orchestrates tokenization, scheduling, and multi-GPU model execution for batched text generation."
+---
+
+`LLMEngine` is the main entry point for running inference with miniVLLM. It manages worker processes for multi-GPU tensor parallelism, a token-level scheduler with paged KV cache, and a model runner that supports CUDA graph replay for fast decode.
+
+## Constructor
+
+```python
+LLMEngine(config: dict)
+```
+
+Creates the engine, spawns worker processes for ranks `1..world_size-1`, initialises the rank-0 `ModelRunner` (which triggers weight loading, warmup, KV cache allocation, and CUDA graph capture), then creates the `Scheduler`.
+
+<Note>
+The `Scheduler` is initialised **after** `ModelRunner` because `ModelRunner.__init__` calls `dist.init_process_group()`, a collective barrier that blocks until every worker rank has joined. Creating the scheduler before that barrier would deadlock on multi-GPU setups.
+</Note>
+
+### Config parameters
+
+The config dict is shared between the scheduler, the model runner, and memory management. All keys consumed by `ModelRunner` must be present.
+
+#### Scheduling and memory
+
+<ParamField body="model_name_or_path" type="string" required>
+  HuggingFace model ID or local path to the model checkpoint.
+  Currently supported: `"Qwen/Qwen3-0.6B"` and `"meta-llama/Llama-3.2-1B-Instruct"`.
+
+  The model is identified by the final path component (e.g. `"Qwen3-0.6B"`), so local paths and HF IDs both work as long as the name matches a supported model.
+</ParamField>
+
+<ParamField body="world_size" type="int" default="1">
+  Number of GPUs to use for tensor-parallel inference. Ranks `1..world_size-1`
+  are spawned as separate processes and communicate via NCCL.
+</ParamField>
+
+<ParamField body="max_num_sequences" type="int" default="16">
+  Maximum number of sequences concurrently active in the scheduler (passed to `Scheduler`).
+</ParamField>
+
+<ParamField body="max_num_batched_tokens" type="int" default="1024">
+  Maximum total tokens across all sequences in a single forward pass (passed to `Scheduler`).
+</ParamField>
+
+<ParamField body="max_cached_blocks" type="int" default="1024">
+  Initial KV cache block pool size hint. **Overridden at runtime** by `ModelRunner.allocate_kv_cache()`, which measures actual free GPU memory and writes the true value back into this key.
+</ParamField>
+
+<ParamField body="block_size" type="int" default="256">
+  Tokens per KV cache block. Must be consistent across engine, scheduler, and attention layers.
+</ParamField>
+
+<ParamField body="eos" type="int" default="50256">
+  EOS token ID used by the scheduler to stop generation.
+
+  <Warning>
+  The default `50256` is the GPT-2 EOS token. For Qwen3-0.6B use `151645`; verify your tokenizer's `eos_token_id` for other models.
+  </Warning>
+</ParamField>
+
+<ParamField body="enforce_eager" type="bool" default="False">
+  When `True`, disables CUDA graph capture so all forward passes run eagerly. Useful for debugging. When `False`, CUDA graphs are captured during initialization for fast decode replay.
+</ParamField>
+
+<ParamField body="gpu_memory_utilization" type="float" default="0.9">
+  Fraction of free GPU memory to use for the KV cache pool. `0.9` means 90% of available memory after model weights is used for blocks.
+</ParamField>
+
+<ParamField body="max_num_batch_tokens" type="int" required>
+  Maximum tokens in a single warmup batch. Used by `ModelRunner.warmup_model()` to size the dry-run forward pass: `batch_size = max_num_batch_tokens // max_model_length`.
+</ParamField>
+
+<ParamField body="max_model_length" type="int" required>
+  Maximum total sequence length (prompt + generated tokens). Used both for warmup sizing and for CUDA graph buffer pre-allocation.
+</ParamField>
+
+#### Model architecture
+
+These keys are required when using `Qwen/Qwen3-0.6B`:
+
+<ParamField body="vocab_size" type="int" required>
+  Vocabulary size. For Qwen3-0.6B: `151936`.
+</ParamField>
+
+<ParamField body="hidden_size" type="int" required>
+  Model hidden dimension. For Qwen3-0.6B: `1024`.
+</ParamField>
+
+<ParamField body="num_heads" type="int" required>
+  Total query attention heads. For Qwen3-0.6B: `16`.
+</ParamField>
+
+<ParamField body="head_dim" type="int" required>
+  Attention head dimension. For Qwen3-0.6B: `128`.
+</ParamField>
+
+<ParamField body="num_kv_heads" type="int" required>
+  Key/value head count (GQA). For Qwen3-0.6B: `8`.
+</ParamField>
+
+<ParamField body="intermediate_size" type="int" required>
+  MLP hidden dimension. For Qwen3-0.6B: `3072`.
+</ParamField>
+
+<ParamField body="num_layers" type="int" required>
+  Number of transformer decoder layers. For Qwen3-0.6B: `28`.
+</ParamField>
+
+<ParamField body="tie_word_embeddings" type="bool" required>
+  Whether to share the embedding and LM head weights. For Qwen3-0.6B: `True`.
+</ParamField>
+
+<ParamField body="base" type="int" required>
+  RoPE base frequency. For Qwen3-0.6B: `1000000`.
+</ParamField>
+
+<ParamField body="rms_norm_epsilon" type="float" required>
+  Epsilon for RMSNorm layers. For Qwen3-0.6B: `1e-6`.
+</ParamField>
+
+<ParamField body="qkv_bias" type="bool" required>
+  Whether QKV projections include bias. For Qwen3-0.6B: `False`.
+</ParamField>
+
+<ParamField body="scale" type="float" required>
+  Attention scale multiplier. Typically `1.0`.
+</ParamField>
+
+<ParamField body="max_position" type="int" required>
+  Maximum position index for the RoPE cache. Must be `>=` `max_model_length`. For Qwen3-0.6B: `32768`.
+</ParamField>
+
+<ParamField body="ffn_bias" type="bool" required>
+  Whether MLP projections include bias. For Qwen3-0.6B: `False`.
+</ParamField>
+
+## Methods
+
+### `generate`
+
+```python
+llm.generate(prompts: list[str], sampling_params: SamplingParams) -> dict
+```
+
+Tokenizes every prompt, adds all sequences to the scheduler, then calls `step()` in a loop until every sequence has finished. Returns a dict with decoded text and raw token IDs, sorted in the same order as the input prompts.
+
+#### Parameters
+
+<ParamField body="prompts" type="list[str]" required>
+  List of plain-text prompt strings. Each string is encoded with the model's
+  tokenizer before being submitted to the scheduler.
+</ParamField>
+
+<ParamField body="sampling_params" type="SamplingParams" required>
+  Sampling configuration applied to every prompt in this batch. See
+  [`SamplingParams`](/api/sampling-params) for field details.
+</ParamField>
+
+#### Return value
+
+<ResponseField name="text" type="list[str]">
+  Decoded completion strings, one per input prompt, in the same order.
+</ResponseField>
+
+<ResponseField name="token_ids" type="list[list[int]]">
+  Raw completion token IDs (prompt tokens excluded), one list per input prompt.
+</ResponseField>
+
+---
+
+### `add_prompt`
+
+```python
+llm.add_prompt(prompt: str, sampling_params: SamplingParams) -> None
+```
+
+Tokenizes `prompt` and enqueues it as a new `Sequence` in the scheduler's waiting queue. Use this method together with `step()` when you need fine-grained control over the generation loop.
+
+<ParamField body="prompt" type="str" required>
+  Plain-text prompt string.
+</ParamField>
+
+<ParamField body="sampling_params" type="SamplingParams" required>
+  Sampling configuration for this sequence.
+</ParamField>
+
+---
+
+### `step`
+
+```python
+llm.step() -> tuple[list[tuple[int, list[int]]], int, bool]
+```
+
+Runs one scheduling + forward-pass iteration:
+
+1. Calls `Scheduler.schedule()` to select the next batch and determine whether it is a prefill or a decode step.
+2. Calls `ModelRunner.run()` via IPC to execute the forward pass and sample one token per sequence.
+3. Calls `Scheduler.postprocess()` to append sampled tokens and check stopping conditions.
+4. Returns metadata for sequences that finished during this step.
+
+#### Return value
+
+<ResponseField name="outputs" type="list[tuple[int, list[int]]]">
+  List of `(seq_id, completion_token_ids)` pairs for sequences that finished
+  in this step. Empty when no sequence finished.
+</ResponseField>
+
+<ResponseField name="num_processed_tokens" type="int">
+  During prefill: total tokens in the scheduled sequences.
+  During decode: number of sequences stepped (one token each).
+</ResponseField>
+
+<ResponseField name="is_prefill" type="bool">
+  `True` when the step processed a prefill batch; `False` for a decode batch.
+</ResponseField>
+
+---
+
+### `exit`
+
+```python
+llm.exit() -> None
+```
+
+Gracefully shuts down the engine. Sends an `"exit"` IPC call to all worker processes, deletes the `ModelRunner`, and joins worker processes. This method is also registered with `atexit` and called automatically when the Python process exits.
+
+---
+
+## Usage example
+
+<CodeGroup>
+
+```python basic usage
+from myvllm.engine.llm_engine import LLMEngine as LLM
+from myvllm.sampling_parameters import SamplingParams
+from transformers import AutoTokenizer
+
+config = {
+    # Scheduling and memory
+    "model_name_or_path": "Qwen/Qwen3-0.6B",
+    "world_size": 1,
+    "max_num_sequences": 16,
+    "max_num_batched_tokens": 1024,
+    "max_cached_blocks": 1024,
+    "block_size": 256,
+    "eos": 151645,
+    "enforce_eager": True,
+    "gpu_memory_utilization": 0.9,
+    "max_num_batch_tokens": 4096,
+    "max_model_length": 128,
+    # Qwen3-0.6B model architecture
+    "vocab_size": 151936,
+    "hidden_size": 1024,
+    "num_heads": 16,
+    "head_dim": 128,
+    "num_kv_heads": 8,
+    "intermediate_size": 3072,
+    "num_layers": 28,
+    "tie_word_embeddings": True,
+    "base": 1000000,
+    "rms_norm_epsilon": 1e-6,
+    "qkv_bias": False,
+    "scale": 1,
+    "ffn_bias": False,
+    "max_position": 32768,
+}
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+llm = LLM(config=config)
+
+sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=128)
+
+prompts = [
+    "introduce yourself",
+    "list all prime numbers within 100",
+]
+# Apply chat template before passing to the engine
+prompts = [
+    tokenizer.apply_chat_template(
+        [{"role": "user", "content": p}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    for p in prompts
+]
+
+outputs = llm.generate(prompts, sampling_params)
+
+for prompt, text in zip(prompts, outputs["text"]):
+    print(f"Prompt:     {prompt}")
+    print(f"Completion: {text}")
+```
+
+```python step-by-step loop
+from myvllm.engine.llm_engine import LLMEngine as LLM
+from myvllm.sampling_parameters import SamplingParams
+
+llm = LLM(config=config)  # config dict as above
+sampling_params = SamplingParams(temperature=0.8, max_tokens=64)
+
+llm.add_prompt("What is the capital of France?", sampling_params)
+llm.add_prompt("Explain gradient descent.", sampling_params)
+
+while not llm.scheduler.is_finished():
+    outputs, num_tokens, is_prefill = llm.step()
+    phase = "prefill" if is_prefill else "decode"
+    print(f"[{phase}] processed {num_tokens} tokens, {len(outputs)} finished")
+```
+
+</CodeGroup>

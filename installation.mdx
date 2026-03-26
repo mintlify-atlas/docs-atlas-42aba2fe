@@ -1,0 +1,154 @@
+---
+title: "Installation"
+description: "Step-by-step guide to installing miniVLLM and its dependencies."
+---
+
+## System requirements
+
+| Requirement | Version |
+|---|---|
+| Python | `>=3.11, <3.12` (exactly Python 3.11) |
+| GPU | CUDA-capable (required for Triton kernels) |
+| Package manager | [`uv`](https://github.com/astral-sh/uv) |
+
+<Warning>
+  Python 3.12 and later are **not supported**. The `pyproject.toml` pins `requires-python = ">=3.11,<3.12"`. Using another version will cause `uv sync` to fail.
+</Warning>
+
+## Step-by-step installation
+
+<Steps>
+  <Step title="Install uv">
+    miniVLLM uses `uv` for reproducible, isolated dependency management. Install it with the official installer:
+
+    ```bash
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    ```
+
+    Restart your shell or run `source $HOME/.local/bin/env` to make the `uv` command available.
+
+    <Tip>
+      You can verify the installation with `uv --version`.
+    </Tip>
+  </Step>
+
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/Wenyueh/MinivLLM.git
+    cd MinivLLM
+    ```
+  </Step>
+
+  <Step title="Sync dependencies">
+    ```bash
+    uv sync
+    ```
+
+    `uv sync` reads `pyproject.toml`, resolves the dependency graph, and installs everything into a project-local virtual environment (`.venv/`). You do not need to create or activate a virtualenv manually.
+
+    To also install the optional development dependencies:
+
+    ```bash
+    uv sync --extra dev
+    ```
+  </Step>
+
+  <Step title="Verify the installation">
+    ```bash
+    uv run python main.py
+    ```
+
+    If the engine initializes and begins printing throughput statistics, installation is successful.
+  </Step>
+</Steps>
+
+## Dependencies explained
+
+The core dependencies declared in `pyproject.toml` are:
+
+| Package | Purpose |
+|---|---|
+| `torch` | GPU tensor operations and the base for all model compute |
+| `transformers` | Model tokenizers and config loading (e.g. `AutoTokenizer`) |
+| `xxhash` | Fast hashing used by the block manager for KV cache prefix matching |
+| `vllm>=0.15.0` | Provides reference kernels and utilities that miniVLLM builds on |
+
+### Optional dev dependencies
+
+Install these when contributing to or testing the project:
+
+| Package | Purpose |
+|---|---|
+| `pytest>=7.0` | Test runner |
+| `black>=23.0` | Code formatter |
+| `isort>=5.0` | Import sorter |
+
+Install with:
+
+```bash
+uv sync --extra dev
+```
+
+## uv sync vs pip install
+
+<Note>
+  miniVLLM is designed to be used with `uv sync`, not `pip install`. The `uv run` prefix ensures commands run inside the managed virtual environment without needing to activate it manually. If you prefer a traditional workflow, you can activate `.venv/` with `source .venv/bin/activate` and then run commands directly.
+</Note>
+
+Do not use `pip install -r requirements.txt` — there is no `requirements.txt`. All dependencies are declared in `pyproject.toml` and managed exclusively through `uv`.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="CUDA not found / no CUDA-capable device">
+    miniVLLM requires a CUDA GPU. If you see an error like `AssertionError: CUDA is not available`, check:
+
+    1. Your machine has an NVIDIA GPU.
+    2. The CUDA toolkit is installed and on your `PATH`. Run `nvidia-smi` to confirm.
+    3. Your `torch` installation includes CUDA support. Run:
+
+    ```python
+    python -c "import torch; print(torch.cuda.is_available())"
+    ```
+
+    If this prints `False`, reinstall PyTorch with the correct CUDA version from [pytorch.org](https://pytorch.org/get-started/locally/).
+  </Accordion>
+
+  <Accordion title="Wrong Python version">
+    If `uv sync` reports a Python version conflict, check your active Python version:
+
+    ```bash
+    python --version
+    ```
+
+    You need Python 3.11 specifically. Install it via your system package manager or [python.org](https://www.python.org/downloads/), then tell `uv` to use it:
+
+    ```bash
+    uv sync --python 3.11
+    ```
+  </Accordion>
+
+  <Accordion title="uv command not found after installation">
+    The `uv` installer adds itself to `~/.local/bin/`. If your shell does not pick it up, add it to your `PATH`:
+
+    ```bash
+    export PATH="$HOME/.local/bin:$PATH"
+    ```
+
+    Add this line to your `~/.bashrc` or `~/.zshrc` to make it permanent.
+  </Accordion>
+
+  <Accordion title="ImportError: No module named 'myvllm'">
+    miniVLLM's source lives under `src/`. When running scripts directly with `python` instead of `uv run python`, the `src/` directory may not be on your `PYTHONPATH`. Always use:
+
+    ```bash
+    uv run python main.py
+    ```
+
+    Or, if using an activated virtualenv, add `src/` to your path manually:
+
+    ```bash
+    export PYTHONPATH=$(pwd)/src:$PYTHONPATH
+    ```
+  </Accordion>
+</AccordionGroup>

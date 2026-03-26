@@ -1,0 +1,69 @@
+---
+title: "Introduction"
+description: "miniVLLM is a from-scratch replication of the vLLM inference engine, featuring custom Triton kernels for paged attention and flash attention."
+---
+
+miniVLLM is a custom implementation of the [vLLM](https://github.com/vllm-project/vllm) LLM inference engine. It is built for educational clarity and functional correctness, replicating vLLM's core mechanisms with self-contained Triton GPU kernels rather than depending on external attention libraries.
+
+The project is based on [Nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm) but extends it with a fully self-contained paged attention and flash attention implementation.
+
+## Why miniVLLM exists
+
+Large language model inference engines like vLLM are complex systems. miniVLLM exists to make these systems understandable by providing a clean, readable reference implementation that you can run, modify, and learn from.
+
+It is both:
+
+- **Educational** — each component maps directly to a concept in vLLM's architecture, making it a practical study companion
+- **Functional** — it runs real inference with paged attention, KV cache management, and continuous batching
+
+## How it relates to vLLM
+
+miniVLLM replicates the core concepts that make vLLM efficient:
+
+| Concept | Description |
+|---|---|
+| **PagedAttention** | Non-contiguous KV cache blocks managed by a block manager, enabling high GPU memory utilization |
+| **Flash attention** | Memory-efficient O(N) online softmax algorithm for the prefill phase, implemented as a custom Triton kernel |
+| **Continuous batching** | Iteration-level scheduling that mixes prefill and decode sequences across steps |
+| **CUDA graphs** | Optional graph capture for decode steps to reduce kernel launch overhead |
+
+## Key components
+
+The `src/myvllm/` package is organized into the following layers:
+
+```
+src/myvllm/
+├── engine/
+│   ├── llm_engine.py      # Public generation API (LLMEngine)
+│   ├── scheduler.py       # Iteration-level sequence scheduling
+│   ├── model_runner.py    # Prefill and decode execution
+│   └── sequence.py        # Sequence and block definitions
+├── models/                # Model implementations (e.g. Qwen3)
+├── layers/                # Attention, MLP, normalization layers
+├── utils/                 # Shared utilities
+└── sampling_parameters.py # SamplingParams dataclass
+```
+
+- **`LLMEngine`** — the top-level entry point. Accepts prompts and returns generated text.
+- **`Scheduler`** — decides which sequences to prefill or decode on each iteration, and allocates KV cache blocks via the block manager.
+- **`ModelRunner`** — runs the forward pass on GPU, handling both prefill and decode modes. Supports multi-GPU tensor parallelism.
+- **`layers/`** — contains the custom Triton kernels for flash attention (prefill) and paged attention (decode).
+- **`models/`** — wires the layers into complete model architectures (currently Qwen3).
+
+## Requirements
+
+- Python `>=3.11, <3.12`
+- A CUDA-capable GPU
+- [`uv`](https://github.com/astral-sh/uv) package manager
+- Core dependencies: `torch`, `transformers`, `xxhash`, `vllm>=0.15.0`
+
+## Get started
+
+<CardGroup cols={2}>
+  <Card title="Quick start" icon="rocket" href="/quickstart">
+    Run your first inference in a few commands.
+  </Card>
+  <Card title="Installation" icon="wrench" href="/installation">
+    Detailed setup guide with troubleshooting.
+  </Card>
+</CardGroup>

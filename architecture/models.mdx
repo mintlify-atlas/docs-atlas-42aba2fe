@@ -1,0 +1,257 @@
+---
+title: "Model Implementations"
+description: "How Qwen3 and Llama 3.2 are assembled from miniVLLM layers, how checkpoint weights are mapped to model parameters, and how to add a new model."
+---
+
+MiniVLLM ships two model families in `myvllm/models/`: **Qwen3** (`qwen3.py`) and **Llama 3.2** (`llama.py`). Both follow the same decoder-only transformer pattern and are fully tensor-parallel.
+
+## Architecture comparison
+
+<Tabs>
+  <Tab title="Qwen3">
+    | Component | Class |
+    |---|---|
+    | Token embedding | `VocabParallelEmbedding` |
+    | Decoder layer | `Qwen3DecoderLayer` |
+    | Self-attention | `Qwen3Attention` |
+    | MLP | `Qwen3MLP` |
+    | Final norm | `LayerNorm` (RMSNorm) |
+    | LM head | `ParallelLMHead` |
+    | RoPE variant | Standard RoPE (`base=10000`) |
+    | QK normalization | Yes (`q_norm`, `k_norm`) |
+  </Tab>
+  <Tab title="Llama 3.2">
+    | Component | Class |
+    |---|---|
+    | Token embedding | `VocabParallelEmbedding` |
+    | Decoder layer | `LlamaDecoderLayer` |
+    | Self-attention | `LlamaAttn` |
+    | MLP | `LlamaMLP` |
+    | Final norm | `LayerNorm` (RMSNorm) |
+    | LM head | `ParallelLMHead` |
+    | RoPE variant | NTK scaling (`base=500000`, `is_llama3=True`) |
+    | QK normalization | No |
+  </Tab>
+</Tabs>
+
+---
+
+## Qwen3 architecture
+
+### Class hierarchy
+
+```
+Qwen3ForCausalLM
+├── Qwen3Model
+│   ├── VocabParallelEmbedding       (embed_tokens)
+│   ├── Qwen3DecoderLayer × N        (layers)
+│   │   ├── LayerNorm                (input_layernorm)
+│   │   ├── Qwen3Attention           (self_attn)
+│   │   │   ├── QKVColumnParallelLinear  (qkv_projection)
+│   │   │   ├── LayerNorm            (q_norm)
+│   │   │   ├── LayerNorm            (k_norm)
+│   │   │   ├── RotaryEmbedding      (rotary_emb)
+│   │   │   ├── Attention            (attention)
+│   │   │   └── RowParallelLinear    (o_proj)
+│   │   ├── LayerNorm                (post_attention_layernorm)
+│   │   └── Qwen3MLP                 (mlp)
+│   │       ├── MergedColumnParallelLinear  (gate_up)
+│   │       ├── SiluAndMul           (activation)
+│   │       └── RowParallelLinear    (down_proj)
+│   └── LayerNorm                    (norm)
+└── ParallelLMHead                   (lm_head)
+```
+
+### Qwen3ForCausalLM constructor
+
+```python
+class Qwen3ForCausalLM(nn.Module):
+    packed_module_mapping = {
+        "q_proj":    ('q_proj',      'q'),
+        "k_proj":    ('k_proj',      'k'),
+        "v_proj":    ('v_proj',      'v'),
+        "gate_up":   ('gate_up_proj', '0'),
+        "gate_down": ('gate_down_proj', '1'),
+    }
+
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int | None = None,         # defaults to hidden_size // num_heads
+        scale: float = 1.0,
+        num_kv_heads: int | None = None,     # GQA: fewer KV heads than Q heads
+        rms_norm_epsilon: float = 1e-5,
+        qkv_bias: bool = False,
+        base: int = 10000,                   # RoPE frequency base
+        max_position: int = 16384,
+        intermediate_size: int = 4 * 1024,
+        ffn_bias: bool = True,
+        num_layers: int = 12,
+        tie_word_embeddings: bool = False,
+        block_size: int = 256,
+    ): ...
+```
+
+### Key architectural choices
+
+**QK normalization.** Qwen3 applies `LayerNorm` (RMSNorm) to the query and key tensors *after* the QKV projection but *before* the rotary embedding. This prevents large values from destabilizing the softmax inside attention. Value tensors are not normalized because they do not participate in the attention score computation.
+
+```python
+# Inside Qwen3Attention.forward (only when qkv_bias is False)
+q = self.q_norm(q)   # LayerNorm per head
+k = self.k_norm(k)
+q, k = self.rotary_emb(positions, q, k)
+o = self.attention(q, k, v)
+```
+
+**Grouped-query attention (GQA).** `num_kv_heads < num_heads` is fully supported. Each GPU holds `num_heads // tp_size` query heads and `num_kv_heads // tp_size` KV heads.
+
+**MergedColumnParallelLinear for gate + up.** The MLP gate and up projections are merged into a single weight tensor. This is required because model checkpoints store `gate_proj.weight` and `up_proj.weight` as separate tensors with size `(intermediate_size, hidden_size)`. A regular `ColumnParallelLinear` over `intermediate_size * 2` would not know where the boundary is when loading. The merged layer's `weight_loader` accepts a `loaded_weight_id` argument (`0` or `1`) that specifies which sub-matrix is being loaded.
+
+```python
+class Qwen3MLP(nn.Module):
+    def __init__(self, hidden_size, intermediate_size, bias=True):
+        self.gate_up = MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[intermediate_size, intermediate_size],
+            bias=bias,
+        )
+        self.activation = SiluAndMul()
+        self.down_proj = RowParallelLinear(
+            input_size=intermediate_size,
+            output_size=hidden_size,
+            bias=bias,
+        )
+
+    def forward(self, x):
+        return self.down_proj(self.activation(self.gate_up(x)))
+```
+
+**Residual connections.** Each `Qwen3DecoderLayer` maintains a running residual that is fused into the `LayerNorm` calls (see [Neural Network Layers — LayerNorm](/architecture/layers)):
+
+```python
+def forward(self, x, residual=None):
+    if residual is not None:
+        x, residual = self.input_layernorm(x, residual)  # fused add + norm
+    else:
+        residual = x
+        x = self.input_layernorm(x)
+    x = self.self_attn(x, positions=positions)
+    x, residual = self.post_attention_layernorm(x, residual)
+    x = self.mlp(x)
+    return x, residual
+```
+
+---
+
+## Llama 3.2 architecture
+
+The Llama 3.2 implementation mirrors Qwen3 almost exactly. The two structural differences are:
+
+1. **No QK normalization.** `LlamaAttn` does not have `q_norm` or `k_norm`.
+2. **NTK-scaled RoPE.** The `RotaryEmbedding` is constructed with `is_llama3=True` and a much larger base (`500000`) plus scaling factors that adapt low-frequency dimensions for sequences beyond the training length.
+
+```python
+self.rotary_emb = RotaryEmbedding(
+    base=rope_base,                   # 500000
+    rotary_embedding=head_dim,
+    max_position=max_position_embeddings,
+    is_llama3=True,
+    llama3_rope_factor=32.0,
+    llama3_rope_high_freq_factor=4.0,
+    llama3_rope_low_freq_factor=1.0,
+    llama3_rope_original_max_position_embeddings=8192,
+)
+```
+
+Because the field names in the checkpoint are identical to the names used in the Qwen3 loader, no changes to `loader.py` are needed.
+
+---
+
+## packed_module_mapping
+
+Checkpoint weight names do not always match the attribute names used in the model. `packed_module_mapping` is a class-level dict that bridges this gap.
+
+```python
+class Qwen3ForCausalLM(nn.Module):
+    packed_module_mapping = {
+        # model attribute name  →  (checkpoint key suffix, weight_loader id)
+        "q_proj":    ('q_proj',       'q'),
+        "k_proj":    ('k_proj',       'k'),
+        "v_proj":    ('v_proj',       'v'),
+        "gate_up":   ('gate_up_proj', '0'),
+        "gate_down": ('gate_down_proj', '1'),
+    }
+```
+
+The loading utility in `myvllm/utils/loader.py` inspects this mapping to know:
+
+- Which checkpoint keys correspond to merged parameters (e.g. `gate_up_proj` maps to sub-index `'0'` of the merged `gate_up` tensor).
+- Which `weight_loader` ID argument to pass when calling the loader (e.g. `'q'`, `'k'`, `'v'` for the QKV projection).
+
+---
+
+## Adding a new model
+
+<Steps>
+  <Step title="Implement the model class">
+    Create `myvllm/models/mymodel.py`. The class must:
+
+    - Be a subclass of `nn.Module`.
+    - Expose `forward(input_ids)` returning hidden states.
+    - Expose `compute_logits(hidden_states)` returning logits.
+    - Define `packed_module_mapping` as a class attribute.
+    - Use the parallel layer classes from `myvllm/layers/` for all weight tensors.
+
+    ```python
+    class MyModelForCausalLM(nn.Module):
+        packed_module_mapping = {
+            "q_proj":  ('q_proj', 'q'),
+            "k_proj":  ('k_proj', 'k'),
+            "v_proj":  ('v_proj', 'v'),
+            "gate_up": ('gate_up_proj', '0'),
+        }
+
+        def forward(self, input_ids): ...
+        def compute_logits(self, hidden_states): ...
+    ```
+  </Step>
+
+  <Step title="Register the model in ModelRunner">
+    Open `myvllm/engine/model_runner.py` and add a `case` to the `match` block inside `ModelRunner.__init__`:
+
+    ```python
+    match model_name:
+        case 'Qwen3-0.6B':
+            self.model = Qwen3ForCausalLM(**config_kwargs)
+        case 'Llama-3.2-1B-Instruct':
+            self.model = LlamaForCausalLM(**config_kwargs)
+        case 'MyModel-1B':          # add this
+            self.model = MyModelForCausalLM(**config_kwargs)
+        case _:
+            raise Exception(f"Unsupported model: {config['model_name_or_path']}")
+    ```
+  </Step>
+
+  <Step title="Provide a config dict">
+    Create a config dict with the model-specific keys expected by your constructor and pass it to `LLMEngine`:
+
+    ```python
+    config = {
+        "model_name_or_path": "/path/to/MyModel-1B",
+        "world_size": 1,
+        "block_size": 256,
+        "vocab_size": 32000,
+        "hidden_size": 2048,
+        # ... other model-specific params
+    }
+    engine = LLMEngine(config)
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+  Study the Llama 3.2 implementation (`llama.py`) as a template — it was added as an exercise on top of the existing Qwen3 code and demonstrates the minimal set of changes required.
+</Tip>

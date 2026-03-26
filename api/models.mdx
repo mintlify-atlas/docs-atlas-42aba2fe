@@ -1,0 +1,352 @@
+---
+title: "Models"
+description: "Causal language model implementations for Qwen3 and Llama 3, including constructor parameters, forward interfaces, checkpoint loading, and a guide for registering new models."
+---
+
+miniVLLM provides two built-in causal LM implementations that follow a common interface:
+
+- `forward(input_ids)` returns the final hidden states.
+- `compute_logits(hidden_states)` projects hidden states to vocabulary logits via the LM head.
+- A class-level `packed_module_mapping` dict maps model parameter names to checkpoint keys, enabling correct loading of fused/sharded weights.
+
+<CardGroup cols={2}>
+  <Card title="Qwen3ForCausalLM" icon="cpu" href="/api/models#qwen3forcausallm">
+    Qwen3 architecture with Q/K norms and GQA
+  </Card>
+  <Card title="LlamaForCausalLM" icon="cpu" href="/api/models#llamaforcausallm">
+    Llama 3 architecture with NTK-scaled RoPE
+  </Card>
+</CardGroup>
+
+---
+
+## Qwen3ForCausalLM
+
+`myvllm.models.qwen3.Qwen3ForCausalLM`
+
+Full Qwen3 causal language model. Stacks `num_layers` of `Qwen3DecoderLayer` inside a `Qwen3Model` backbone, then attaches a `ParallelLMHead` for next-token prediction. Supports optional weight tying between the token embedding and the LM head.
+
+**Key architectural differences from Llama 3:**
+- Per-head Q and K RMSNorm layers inside each attention block (applied when `qkv_bias=False`).
+- Default RoPE base of `10000` (versus `500000` for Llama 3).
+- Default max position of `16384`.
+
+### Constructor
+
+<ParamField path="vocab_size" type="int" required>
+  Vocabulary size. Controls the size of the token embedding table and the LM head.
+</ParamField>
+
+<ParamField path="hidden_size" type="int" required>
+  Model hidden dimension (embedding size and residual stream width).
+</ParamField>
+
+<ParamField path="num_heads" type="int" required>
+  Total number of query attention heads across all tensor-parallel ranks.
+</ParamField>
+
+<ParamField path="head_dim" type="int">
+  Dimension of each attention head. Defaults to `hidden_size // num_heads`.
+</ParamField>
+
+<ParamField path="scale" type="float" default="1.0">
+  Attention scale multiplier applied alongside `1 / sqrt(head_dim)`.
+</ParamField>
+
+<ParamField path="num_kv_heads" type="int">
+  Total number of key/value heads. Set to a value smaller than `num_heads` for grouped-query attention (GQA). Defaults to `num_heads`.
+</ParamField>
+
+<ParamField path="rms_norm_epsilon" type="float" default="1e-5">
+  Epsilon used in all RMSNorm layers.
+</ParamField>
+
+<ParamField path="qkv_bias" type="bool" default="False">
+  Whether to include bias in the QKV projection. When `False`, per-head Q and K norms are applied before attention.
+</ParamField>
+
+<ParamField path="base" type="int" default="10000">
+  RoPE base frequency.
+</ParamField>
+
+<ParamField path="max_position" type="int" default="16384">
+  Maximum sequence length the positional embedding cache is pre-computed for.
+</ParamField>
+
+<ParamField path="intermediate_size" type="int" default="4096">
+  Hidden dimension of the MLP feed-forward layers.
+</ParamField>
+
+<ParamField path="ffn_bias" type="bool" default="True">
+  Whether to include bias in the MLP projections.
+</ParamField>
+
+<ParamField path="num_layers" type="int" default="12">
+  Number of transformer decoder layers.
+</ParamField>
+
+<ParamField path="tie_word_embeddings" type="bool" default="False">
+  If `True`, the LM head shares the same weight tensor as the token embedding.
+</ParamField>
+
+<ParamField path="block_size" type="int" default="256">
+  Paged KV cache block size, passed through to each `Attention` module.
+</ParamField>
+
+### forward
+
+```python
+forward(input_ids: torch.Tensor) -> torch.Tensor
+```
+
+Runs the full Qwen3 backbone (embedding → decoder layers → final RMSNorm) and returns the hidden states. Does **not** project to logits; call `compute_logits` separately.
+
+| Argument | Shape | Description |
+|---|---|---|
+| `input_ids` | `(total_tokens,)` or `(batch_size, seq_len)` | Token IDs |
+| **returns** | same leading dims, `hidden_size` last | Final hidden states |
+
+### compute\_logits
+
+```python
+compute_logits(hidden_states: torch.Tensor) -> torch.Tensor
+```
+
+Projects hidden states to vocabulary logits using `ParallelLMHead`. In a tensor-parallel setup, rank 0 gathers logits from all ranks and returns the full `(batch_or_tokens, vocab_size)` tensor; other ranks return a partial shard.
+
+### Sub-components
+
+| Class | Role |
+|---|---|
+| `Qwen3Model` | Embedding + decoder layer stack + final norm |
+| `Qwen3DecoderLayer` | Single transformer block (norm → attn → norm → MLP) with fused residual |
+| `Qwen3Attention` | QKV projection, optional Q/K norms, RoPE, paged attention, output projection |
+| `Qwen3MLP` | Gate+up projection (merged), SiluAndMul activation, down projection |
+
+### packed\_module\_mapping
+
+`Qwen3ForCausalLM` defines a class attribute that maps internal parameter names to their corresponding keys in a HuggingFace-style checkpoint and the sub-index within a fused weight:
+
+```python
+packed_module_mapping = {
+    "q_proj":   ('q_proj',        'q'),
+    "k_proj":   ('k_proj',        'k'),
+    "v_proj":   ('v_proj',        'v'),
+    "gate_up":  ('gate_up_proj',  '0'),
+    "gate_down":("gate_down_proj",'1'),
+}
+```
+
+The model runner uses this mapping to call the correct `weight_loader` overload when loading pre-trained checkpoints.
+
+**Quick start**
+
+```python
+import torch
+from myvllm.models.qwen3 import Qwen3ForCausalLM
+
+model = Qwen3ForCausalLM(
+    vocab_size=151936,
+    hidden_size=2048,
+    num_heads=16,
+    num_kv_heads=8,
+    intermediate_size=6144,
+    num_layers=28,
+    max_position=32768,
+).cuda()
+
+input_ids = torch.randint(0, 151936, (1, 64)).cuda()
+hidden    = model(input_ids)         # (1, 64, 2048)
+logits    = model.compute_logits(hidden)  # (1, 64, 151936) on rank 0
+```
+
+---
+
+## LlamaForCausalLM
+
+`myvllm.models.llama.LlamaForCausalLM`
+
+Llama 3 causal language model. Structurally identical to `Qwen3ForCausalLM` but with the following differences:
+
+- **No Q/K norms** — `LlamaAttn` does not apply per-head RMSNorm to queries and keys.
+- **NTK-scaled RoPE** — `RotaryEmbedding` is initialized with `is_llama3=True`, enabling the NTK-by-parts long-context frequency scaling.
+- **Higher RoPE base** — defaults to `500000` instead of `10000`.
+- **Larger context window** — defaults to `131072` instead of `16384`.
+- **`tie_word_embeddings=True`** by default.
+
+### Constructor
+
+<ParamField path="vocab_size" type="int" default="128256">
+  Vocabulary size.
+</ParamField>
+
+<ParamField path="hidden_size" type="int" default="2048">
+  Model hidden dimension.
+</ParamField>
+
+<ParamField path="head_dim" type="int" default="64">
+  Dimension of each attention head.
+</ParamField>
+
+<ParamField path="num_qo_heads" type="int" default="32">
+  Total number of query/output heads across all tensor-parallel ranks.
+</ParamField>
+
+<ParamField path="num_kv_heads" type="int" default="8">
+  Total number of key/value heads.
+</ParamField>
+
+<ParamField path="has_attn_bias" type="bool" default="False">
+  Whether to add bias in the QKV projection.
+</ParamField>
+
+<ParamField path="rms_norm_epsilon" type="float" default="1e-5">
+  Epsilon for all RMSNorm layers.
+</ParamField>
+
+<ParamField path="rope_base" type="int" default="500000">
+  RoPE base frequency. The higher value extends the effective context length.
+</ParamField>
+
+<ParamField path="max_position_embeddings" type="int" default="131072">
+  Maximum sequence length the positional cache covers.
+</ParamField>
+
+<ParamField path="intermediate_size" type="int" default="8192">
+  MLP feed-forward hidden dimension.
+</ParamField>
+
+<ParamField path="ffn_bias" type="bool" default="False">
+  Whether to include bias in the MLP projections.
+</ParamField>
+
+<ParamField path="num_layers" type="int" default="16">
+  Number of transformer decoder layers.
+</ParamField>
+
+<ParamField path="block_size" type="int" default="256">
+  Paged KV cache block size.
+</ParamField>
+
+<ParamField path="tie_word_embeddings" type="bool" default="True">
+  If `True`, the LM head shares the embedding weight.
+</ParamField>
+
+### forward
+
+```python
+forward(input_ids: torch.Tensor) -> torch.Tensor
+```
+
+Same interface as `Qwen3ForCausalLM.forward`. Returns final hidden states.
+
+### compute\_logits
+
+```python
+compute_logits(hidden_states: torch.Tensor) -> torch.Tensor
+```
+
+Same interface as `Qwen3ForCausalLM.compute_logits`. Projects to vocabulary logits.
+
+### Sub-components
+
+| Class | Role |
+|---|---|
+| `LlamaModel` | Embedding + decoder layer stack + final norm |
+| `LlamaDecoderLayer` | Single transformer block with fused residual |
+| `LlamaAttn` | QKV projection, NTK-scaled RoPE, paged attention, output projection |
+| `LlamaMLP` | Gate+up projection (merged), SiluAndMul activation, down projection |
+
+**Quick start**
+
+```python
+import torch
+from myvllm.models.llama import LlamaForCausalLM
+
+model = LlamaForCausalLM(
+    vocab_size=128256,
+    hidden_size=2048,
+    head_dim=64,
+    num_qo_heads=32,
+    num_kv_heads=8,
+    num_layers=16,
+).cuda()
+
+input_ids = torch.randint(0, 128256, (1, 32)).cuda()
+hidden    = model(input_ids)
+logits    = model.compute_logits(hidden)
+```
+
+---
+
+## Adding a new model
+
+Follow these steps to add a new architecture to miniVLLM.
+
+<Steps>
+  <Step title="Implement the ForCausalLM class">
+    Create `src/myvllm/models/mymodel.py`. The class must expose:
+
+    ```python
+    class MyModelForCausalLM(nn.Module):
+        # Maps internal param names to (checkpoint_key, sub_index)
+        packed_module_mapping: dict[str, tuple[str, str]] = { ... }
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            """Return final hidden states."""
+            ...
+
+        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            """Project hidden states to logits."""
+            ...
+    ```
+
+    Use the existing layer primitives from `myvllm.layers` (`ColumnParallelLinear`, `RowParallelLinear`, `LayerNorm`, `Attention`, etc.) to ensure correct tensor-parallel behavior.
+  </Step>
+
+  <Step title="Implement weight_loader for custom sharding">
+    If your model has parameters that do not map 1-to-1 to checkpoint keys — e.g., fused QKV or merged gate+up projections — override `weight_loader` on the relevant `nn.Parameter`:
+
+    ```python
+    def custom_weight_loader(
+        param: nn.Parameter,
+        loaded_weights: torch.Tensor,
+        shard_id: str,          # 'q' / 'k' / 'v' or integer index
+    ):
+        # 1. Compute the offset and shard size for this rank
+        # 2. Slice the correct rows/columns from loaded_weights
+        # 3. Copy into param.data
+        ...
+
+    layer.weight.weight_loader = custom_weight_loader
+    ```
+
+    Refer to `QKVColumnParallelLinear.weight_loader` and `MergedColumnParallelLinear.weight_loader` in [`myvllm/layers/linear.py`](/api/layers#linear-layers) for reference implementations.
+  </Step>
+
+  <Step title="Register in the model runner">
+    Open the model runner's model registry and add an entry for your new class:
+
+    ```python
+    MODEL_REGISTRY = {
+        "qwen3":    Qwen3ForCausalLM,
+        "llama":    LlamaForCausalLM,
+        "mymodel":  MyModelForCausalLM,   # add this line
+    }
+    ```
+
+    The runner uses this registry to instantiate the correct class from the model config.
+  </Step>
+
+  <Step title="Export from the models package">
+    Add the import to `src/myvllm/models/__init__.py`:
+
+    ```python
+    from .mymodel import MyModelForCausalLM
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+Keep each decoder layer's `forward` signature consistent with `Qwen3DecoderLayer` — accepting `(x, residual)` and returning `(x, residual)` — so the backbone loop works without modification.
+</Tip>

@@ -1,0 +1,155 @@
+---
+title: "Tokens Per Second"
+description: "Measure end-to-end inference throughput of miniVLLM and compare it against vLLM and Hugging Face Transformers using Qwen3-0.6B."
+---
+
+The TPS benchmark measures end-to-end inference throughput: how many output tokens the engine produces per second across all sequences in a batch. Run it with:
+
+```bash
+uv run python benchmark_tps.py
+```
+
+## What TPS measures
+
+TPS (tokens per second) is calculated as:
+
+```
+tps = total_output_tokens / wall_clock_seconds
+```
+
+The benchmark counts every token generated across all sequences in the batch, then divides by the total elapsed time from the first `generate()` call to the last `cuda_sync()`. This is end-to-end throughput — it includes both the prefill cost for each prompt and the decode cost for every generated token.
+
+<Note>
+TPS is a throughput metric, not a latency metric. A high TPS means the engine is keeping the GPU busy across the full batch. A low per-sequence latency does not necessarily imply high TPS if the batch is small.
+</Note>
+
+## Engines compared
+
+<CardGroup cols={3}>
+  <Card title="miniVLLM" icon="bolt">
+    The custom engine under development. Uses paged attention, a block-based KV cache, and an iteration-level scheduler. Configured via a Python `config` dict.
+  </Card>
+  <Card title="vLLM" icon="gauge">
+    The reference production engine. Serves as the performance target. Loaded with `gpu_memory_utilization=0.75` and `max_model_len=256`.
+  </Card>
+  <Card title="Transformers" icon="book">
+    The Hugging Face baseline. No paging, no batched scheduling — uses `model.generate()` directly with padded inputs.
+  </Card>
+</CardGroup>
+
+## Benchmark setup
+
+The benchmark targets `Qwen/Qwen3-0.6B` with three prompts that vary in expected output length:
+
+```python
+PROMPTS = [
+    "introduce yourself",
+    "list all prime numbers within 100",
+    "give me your opinion on the impact of artificial intelligence on society",
+]
+
+OUTPUT_TOKENS = 256  # maximum tokens generated per prompt
+WARMUP_STEPS  = 2   # generate() calls before timing begins
+```
+
+All three prompts are formatted with the model's chat template before being passed to each engine.
+
+## miniVLLM engine configuration
+
+The config dict used in the benchmark:
+
+```python
+config = {
+    'max_num_sequences':      16,
+    'max_num_batched_tokens': 1024,
+    'max_cached_blocks':      1024,
+    'block_size':             256,
+    'world_size':             1,
+    'model_name_or_path':     'Qwen/Qwen3-0.6B',
+    'enforce_eager':          True,
+    'vocab_size':             151936,
+    'hidden_size':            1024,
+    'num_heads':              16,
+    'head_dim':               128,
+    'num_kv_heads':           8,
+    'intermediate_size':      3072,
+    'num_layers':             28,
+    'max_model_length':       128,
+    'gpu_memory_utilization': 0.9,
+    # ... additional model hyperparameters
+}
+```
+
+## How TPS is reported
+
+Each engine function returns a dict with three fields:
+
+```python
+{
+    "latency": float,  # wall-clock seconds for generate()
+    "tokens":  int,    # total output tokens across all sequences
+    "tps":     float,  # tokens / latency
+}
+```
+
+The main function prints a summary table:
+
+```
+=== Benchmark Results ===
+minivllm:
+  latency: x.xxxx
+  tokens:  xxx
+  tps:     xxx.xxxx
+vLLM:
+  latency: x.xxxx
+  tokens:  xxx
+  tps:     xxx.xxxx
+transformers:
+  latency: x.xxxx
+  tokens:  xxx
+  tps:     xxx.xxxx
+```
+
+## Prefill TPS vs. decode TPS
+
+The benchmark reports a single blended TPS number that covers both phases:
+
+<Tabs>
+  <Tab title="Prefill TPS">
+    Prefill processes all input prompt tokens in parallel. It is compute-bound and typically fast per token. For short prompts with long outputs, prefill is a small fraction of total time.
+
+    Prefill cost is roughly proportional to `sum(prompt_lengths)` and grows with sequence length due to the O(N²) attention computation.
+  </Tab>
+  <Tab title="Decode TPS">
+    Decode generates one token per step across all active sequences. It is memory-bandwidth-bound — each step must load the full KV cache for every sequence. Decode dominates total latency when `OUTPUT_TOKENS` is large.
+
+    The paged attention implementation in miniVLLM is designed to keep decode throughput high by avoiding unnecessary memory copies and supporting non-contiguous KV cache blocks.
+  </Tab>
+</Tabs>
+
+## Factors that affect TPS
+
+<AccordionGroup>
+  <Accordion title="Batch size (max_num_sequences)">
+    Larger batches amortize the fixed per-step overhead across more sequences and keep the GPU's streaming multiprocessors busy. The benchmark uses `max_num_sequences=16`. Increasing this value (if GPU memory allows) is the single most effective way to raise throughput.
+  </Accordion>
+  <Accordion title="max_num_batched_tokens">
+    Controls how many tokens the scheduler is allowed to prefill in a single iteration. A higher limit lets the engine process more prompt tokens per step during prefill, reducing the number of prefill iterations. The benchmark uses `max_num_batched_tokens=1024`.
+  </Accordion>
+  <Accordion title="block_size">
+    The number of token positions stored per physical KV cache block. A larger `block_size` reduces block table overhead but increases internal fragmentation (unused slots at the end of each sequence's last block). The benchmark uses `block_size=256`.
+  </Accordion>
+  <Accordion title="GPU memory (gpu_memory_utilization)">
+    Set to `0.9` for miniVLLM — 90% of available GPU memory is reserved for the KV cache pool (`max_cached_blocks=1024`). More memory means more sequences can be cached simultaneously before eviction is needed.
+  </Accordion>
+  <Accordion title="Sequence length">
+    Longer sequences mean more tokens to attend over at each decode step, which increases per-step latency and reduces decode TPS. The benchmark caps generation at `OUTPUT_TOKENS=256` and the model's `max_model_length=128`.
+  </Accordion>
+  <Accordion title="enforce_eager">
+    Set to `True` in the benchmark, which disables CUDA graph capture. Enabling CUDA graphs (`enforce_eager=False`) can significantly improve decode TPS for fixed batch sizes by reducing kernel launch overhead.
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+To maximize TPS in your own experiments, start by increasing `max_num_sequences` and `max_num_batched_tokens`. If the GPU has headroom, also raise `gpu_memory_utilization` to allow a larger KV cache pool and set `enforce_eager=False` to enable CUDA graph execution.
+</Tip>

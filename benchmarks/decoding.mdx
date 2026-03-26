@@ -1,0 +1,134 @@
+---
+title: "Decoding Benchmark"
+description: "Compare Naive PyTorch, Optimized PyTorch, and a Triton kernel for paged attention during the decode phase, including block table lookup mechanics and CUDA chunk processing."
+---
+
+The decoding benchmark measures the per-step cost of generating one new token. During decode, a single query vector attends to all cached K/V values from every previous position across non-contiguous physical memory blocks. Run it with:
+
+```bash
+uv run python benchmark_decoding.py
+```
+
+## What paged attention decode does
+
+Unlike prefill, which processes a full prompt at once, decode runs one step at a time. At each step:
+
+1. The model produces a single query vector `q` of shape `(batch_size, num_heads, head_dim)`.
+2. That query must attend to all `context_len` cached key and value vectors.
+3. Those cached vectors are stored in a paged KV cache — a pool of fixed-size physical blocks that are allocated on demand and may be non-contiguous in memory.
+
+The block table maps logical token positions to physical block indices:
+
+```python
+# Lookup pattern used by all three implementations
+physical_block_idx = block_tables[batch_idx][token_idx // block_size]
+block_offset       = token_idx % block_size
+```
+
+Each implementation must resolve this indirection for every one of the `context_len` tokens before it can compute attention scores.
+
+## Implementations compared
+
+<Tabs>
+  <Tab title="Naive PyTorch">
+    Iterates over each sequence in the batch with a Python `for` loop. For each sequence it walks the block table block by block, gathers slices of `k_cache` and `v_cache` with `torch.cat`, pads all sequences to `max_context_len`, then runs standard `torch.matmul` attention.
+
+    The Python-level loop and repeated `torch.cat` calls make this the slowest option, but it is the easiest to read and debug.
+
+    ```python
+    # Core gather loop (per sequence)
+    for block_idx in range(num_blocks_needed):
+        block_id = block_tables[i, block_idx].item()
+        seq_k_list.append(k_cache[block_id])  # (block_size, num_kv_heads, head_dim)
+        seq_v_list.append(v_cache[block_id])
+    seq_k = torch.cat(seq_k_list, dim=0)[:seq_len]
+    ```
+  </Tab>
+  <Tab title="Optimized PyTorch">
+    Eliminates the Python loop over the sequence dimension with vectorized index gathering. For each item in the batch it slices the valid block indices from the block table in one operation, filters out padding entries (`!= -1`), then uses advanced indexing to gather all blocks at once:
+
+    ```python
+    valid_blocks = block_tables[i, :num_blocks_needed]
+    valid_blocks = valid_blocks[valid_blocks != -1]
+    gathered_k = k_cache[valid_blocks].reshape(-1, num_kv_heads, head_dim)[:seq_len]
+    ```
+
+    The gathered K and V tensors are written into a pre-allocated padded buffer, then a length mask is applied before the batched `torch.matmul` attention call. Fewer Python round-trips and no `torch.cat` allocations make this noticeably faster than the naive version.
+  </Tab>
+  <Tab title="Triton Kernel">
+    A single Triton kernel handles the entire decode step. The launch grid is `(batch_size, num_heads)` — one thread block per `(batch, head)` pair. Inside the kernel, tokens are processed in chunks of `BLOCK_N` (64 for `head_dim ≤ 128`, 32 otherwise).
+
+    For each chunk the kernel:
+    1. Resolves the physical block index for each token via the block table.
+    2. Loads the K vector and computes the dot-product score.
+    3. Applies an online softmax update (running max `m_i` and normalizer `l_i`).
+    4. Loads the V vector and accumulates the weighted sum.
+
+    All block table lookups and memory accesses happen inside the GPU without any host-side Python overhead.
+
+    ```python
+    BLOCK_N = 64 if head_dim <= 128 else 32
+    grid = (batch_size, num_heads)
+    paged_attention_decode_kernel[grid](
+        output, query, k_cache, v_cache,
+        block_tables, context_lens, ...
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## Benchmark configurations
+
+The script runs four configurations that span different batch size and context length regimes:
+
+| `batch_size` | `seq_len` | `num_iterations` | What it tests |
+|---|---|---|---|
+| 2 | 60 | 100 | Small batch, short context |
+| 1 | 512 | 100 | Single sequence, medium context |
+| 16 | 256 | 50 | Large batch, medium context |
+| 4 | 2048 | 20 | Small batch, long context |
+
+All configurations use `num_heads=32`, `num_kv_heads=8`, `head_dim=128`, and `block_size=16`. Ten warmup iterations run before timing begins, and `torch.cuda.synchronize()` fences each timed loop.
+
+<Note>
+`block_size=16` means each physical KV block holds 16 token positions. A sequence of 512 tokens requires 32 physical blocks, and the block table for that sequence has 32 entries that may point to non-contiguous locations in the cache pool.
+</Note>
+
+## Block table lookup mechanics
+
+The block table is a 2-D integer tensor of shape `(batch_size, max_num_blocks)`. A value of `-1` indicates that a slot has not been allocated. The setup used by the benchmark assigns contiguous block IDs for simplicity:
+
+```python
+# From setup_test_data()
+max_num_blocks = ceil(seq_len / block_size)
+total_blocks   = batch_size * max_num_blocks
+
+# KV cache pool
+k_cache = torch.randn(total_blocks, block_size, num_kv_heads, head_dim, ...)
+v_cache = torch.randn(total_blocks, block_size, num_kv_heads, head_dim, ...)
+
+# Block table: each row lists the physical block indices for that sequence
+block_tables = torch.arange(total_blocks).reshape(batch_size, max_num_blocks)
+```
+
+In a production engine the block table entries are non-contiguous — blocks for a single sequence may be scattered across the physical pool — which is exactly why the lookup indirection exists.
+
+## Why CUDA chunk processing matters
+
+The Triton kernel processes tokens in chunks of `BLOCK_N` rather than one at a time or all at once. This matters for two reasons:
+
+<Steps>
+  <Step title="Amortize block table lookups">
+    Resolving `block_tables[batch_idx][token_idx // block_size]` is a random-access load from global memory. By batching `BLOCK_N` tokens per iteration, the kernel can reuse the same physical block pointer for all `block_size` tokens that fall within one block, reducing the number of expensive pointer chases.
+  </Step>
+  <Step title="Enable online softmax across the full context">
+    Chunking lets the kernel apply the same running-max online softmax used by Flash Attention. A running maximum `m_i` and normalizer `l_i` are updated after each chunk, so the kernel never has to store all `context_len` raw scores simultaneously — only the current chunk's `BLOCK_N` scores fit in registers at any time.
+  </Step>
+  <Step title="Keep register pressure manageable">
+    Loading all context tokens at once would exhaust GPU registers for long sequences. Chunk-based processing bounds the per-iteration working set to `BLOCK_N × head_dim` elements regardless of how long the context is.
+  </Step>
+</Steps>
+
+<Tip>
+For long-context workloads (`seq_len=2048`) the Triton kernel's advantage over Optimized PyTorch grows because the Python-side batch gather loop in the PyTorch implementations scales with `batch_size`, while the Triton kernel keeps all work on the GPU.
+</Tip>

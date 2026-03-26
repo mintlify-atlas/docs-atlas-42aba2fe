@@ -1,0 +1,137 @@
+---
+title: "SamplingParams"
+description: "Dataclass for controlling token sampling behavior — temperature, output length limits, and EOS handling."
+---
+
+`SamplingParams` is a Python `dataclass` that bundles the generation hyperparameters for a single inference request. One `SamplingParams` instance is attached to every `Sequence` and consulted by the `Scheduler` to determine when to stop generation.
+
+## Definition
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class SamplingParams:
+    temperature: float = 1.0
+    max_tokens: int = 64
+    ignore_eos: bool = False
+    max_model_length: int | None = None
+
+    def __post_init__(self):
+        assert self.temperature > 1e-10, "greedy sampling is not permitted"
+```
+
+## Fields
+
+<ParamField body="temperature" type="float" default="1.0">
+  Softmax temperature applied before multinomial sampling. Higher values
+  increase randomness; lower values make the distribution more peaked.
+
+  <Warning>
+  Greedy decoding (`temperature = 0`) is not supported. Setting `temperature`
+  to any value `<= 1e-10` raises an `AssertionError` in `__post_init__`.
+  </Warning>
+
+  ```python
+  # Conservative creative writing
+  SamplingParams(temperature=0.6)
+
+  # More varied outputs
+  SamplingParams(temperature=1.2)
+  ```
+</ParamField>
+
+<ParamField body="max_tokens" type="int" default="64">
+  Maximum number of **completion** tokens to generate. The prompt tokens are
+  not counted. Generation stops as soon as `num_completion_tokens >= max_tokens`,
+  regardless of whether EOS has been sampled.
+
+  ```python
+  # Generate at most 256 new tokens
+  SamplingParams(temperature=0.8, max_tokens=256)
+  ```
+</ParamField>
+
+<ParamField body="ignore_eos" type="bool" default="false">
+  When `False` (default), generation stops as soon as the EOS token ID
+  configured in `LLMEngine` is sampled. When `True`, EOS tokens are treated
+  as ordinary tokens and generation continues until `max_tokens` or
+  `max_model_length` is reached.
+</ParamField>
+
+<ParamField body="max_model_length" type="int | None" default="None">
+  Maximum **total** sequence length, counting both prompt and completion tokens.
+  When set, generation stops as soon as `num_tokens >= max_model_length`.
+  `None` means no total-length limit (only `max_tokens` applies).
+
+  ```python
+  # Hard cap at 512 total tokens (prompt + completion)
+  SamplingParams(temperature=0.7, max_tokens=256, max_model_length=512)
+  ```
+</ParamField>
+
+## Stopping conditions
+
+The `Scheduler` checks three independent stopping conditions after each decode step. Generation halts as soon as **any** condition is satisfied:
+
+| Condition | Field | Triggered when |
+|---|---|---|
+| EOS token | `ignore_eos` | `token_id == eos` and `ignore_eos` is `False` |
+| Completion limit | `max_tokens` | `num_completion_tokens >= max_tokens` |
+| Total length limit | `max_model_length` | `max_model_length is not None` and `num_tokens >= max_model_length` |
+
+## Validation
+
+`SamplingParams` validates its fields in `__post_init__`, which runs automatically on construction:
+
+```python
+def __post_init__(self):
+    assert self.temperature > 1e-10, "greedy sampling is not permitted"
+```
+
+<Warning>
+Greedy decoding is explicitly unsupported. Passing `temperature=0` raises:
+```
+AssertionError: greedy sampling is not permitted
+```
+Use a small positive temperature such as `0.01` instead if near-deterministic output is needed.
+</Warning>
+
+## Usage examples
+
+<CodeGroup>
+
+```python default params
+from myvllm.sampling_parameters import SamplingParams
+
+# Defaults: temperature=1.0, max_tokens=64, no length cap
+params = SamplingParams()
+```
+
+```python typical chat usage
+from myvllm.sampling_parameters import SamplingParams
+from myvllm.engine.llm_engine import LLMEngine as LLM
+
+params = SamplingParams(
+    temperature=0.6,
+    max_tokens=256,
+    max_model_length=128,  # hard cap including prompt
+)
+
+llm = LLM(config=config)
+outputs = llm.generate(["Hello!"], params)
+print(outputs["text"][0])
+```
+
+```python ignore EOS
+from myvllm.sampling_parameters import SamplingParams
+
+# Continue past EOS; stop only when max_tokens is reached
+params = SamplingParams(
+    temperature=1.0,
+    max_tokens=128,
+    ignore_eos=True,
+)
+```
+
+</CodeGroup>

@@ -1,0 +1,286 @@
+---
+title: "ModelRunner"
+description: "Per-rank model execution backend with paged attention, CUDA graph replay, and inter-process communication for multi-GPU inference."
+---
+
+`ModelRunner` runs on every GPU rank. The rank-0 instance is owned directly by `LLMEngine`; ranks `1..N-1` run in separate worker processes and communicate via shared memory + `multiprocessing.Event`. It handles weight loading, KV cache allocation, prefill/decode input preparation, and optional CUDA graph capture for fast decode.
+
+## Constructor
+
+```python
+ModelRunner(config: dict, rank: int, event: Event | list[Event])
+```
+
+During `__init__` the following steps happen in order:
+
+1. `dist.init_process_group("nccl", ...)` — collective barrier; all ranks must call this.
+2. Model construction and weight loading on the assigned GPU.
+3. `warmup_model()` — dry-run forward pass to measure peak memory.
+4. `allocate_kv_cache()` — allocates the KV cache pool.
+5. `capture_cudagraph()` — captures decode graphs (skipped if `enforce_eager=True`).
+6. Shared-memory setup for IPC (skipped when `world_size == 1`).
+
+<ParamField body="config" type="dict" required>
+  The same config dict passed to `LLMEngine`. Must include all model architecture
+  keys (`vocab_size`, `hidden_size`, `num_layers`, etc.) as well as the following
+  runtime keys consumed directly by `ModelRunner`:
+
+  | Key | Used by | Description |
+  |---|---|---|
+  | `block_size` | all | Tokens per KV cache block |
+  | `world_size` | all | Number of GPU ranks |
+  | `enforce_eager` | `__init__` | Skip CUDA graph capture when `True` |
+  | `max_num_batch_tokens` | `warmup_model` | Tokens in warmup dry-run batch |
+  | `max_model_length` | `warmup_model`, `capture_cudagraph` | Max total sequence length |
+  | `max_num_seqs` | `capture_cudagraph` | Upper bound for CUDA graph batch sizes (only required when `enforce_eager=False`) |
+  | `gpu_memory_utilization` | `allocate_kv_cache` | Fraction of free GPU memory for KV pool |
+  | `num_layers` | `allocate_kv_cache` | Number of transformer layers |
+  | `num_kv_heads` | `allocate_kv_cache` | Total KV head count (divided by `world_size` per rank) |
+  | `head_dim` | `allocate_kv_cache` | Head dimension (or inferred from `hidden_size / num_heads`) |
+  | `vocab_size` | `capture_cudagraph` | Vocabulary size for output buffer pre-allocation |
+</ParamField>
+
+<ParamField body="rank" type="int" required>
+  CUDA device index for this worker. Rank 0 is the primary process; ranks
+  `1..world_size-1` are spawned workers.
+</ParamField>
+
+<ParamField body="event" type="Event | list[Event]" required>
+  For rank 0: a list of `multiprocessing.Event` objects, one per worker rank,
+  used to signal that new IPC data has been written to shared memory.
+  For rank `!= 0`: a single `Event` used to wait for commands from rank 0.
+</ParamField>
+
+## Methods
+
+### `warmup_model`
+
+```python
+model_runner.warmup_model() -> None
+```
+
+Runs a synthetic prefill forward pass at the maximum batch size (`max_num_batch_tokens // max_model_length` sequences of length `max_model_length`) to force all CUDA kernels to JIT-compile and to record the peak GPU memory footprint. The result is used by `allocate_kv_cache()` to determine how much memory is available for the KV cache pool.
+
+---
+
+### `allocate_kv_cache`
+
+```python
+model_runner.allocate_kv_cache() -> None
+```
+
+Allocates a single global KV cache tensor of shape
+`(2, num_layers, max_cached_blocks, block_size, num_kv_heads_per_rank, head_dim)`
+and assigns slices of it to each attention layer's `k_cache` / `v_cache` attributes.
+
+The number of blocks is derived from:
+
+```
+available_mem = free_gpu_mem * gpu_memory_utilization - (peak_mem - current_mem)
+num_blocks = floor(available_mem / bytes_per_block)
+```
+
+When `world_size > 1`, an `all_reduce(MIN)` synchronises the block count across ranks so the scheduler never allocates more blocks than the most memory-constrained rank can hold.
+
+<Note>
+`max_cached_blocks` in `config` is overwritten with the computed value after this method returns.
+</Note>
+
+---
+
+### `prepare_prefill`
+
+```python
+model_runner.prepare_prefill(seqs: list[Sequence]) -> torch.Tensor
+```
+
+Builds the input tensors for a varlen prefill forward pass and stores them in the thread-local attention context via `set_context(is_prefill=True, ...)`:
+
+| Tensor | Description |
+|---|---|
+| `input_ids` | Concatenated prompt tokens (excluding prefix-cached tokens) |
+| `cu_seqlens_q` | Cumulative query sequence lengths, shape `(num_seqs + 1,)` |
+| `cu_seqlens_k` | Cumulative key sequence lengths (includes cached prefix) |
+| `slot_mapping` | KV cache slot indices for each new token to be written |
+| `block_tables` | Per-sequence block ID table for reading cached KV values |
+
+Prefix-cached tokens are skipped in `input_ids` and `slot_mapping` — only uncached tokens require a new forward pass.
+
+<ParamField body="seqs" type="list[Sequence]" required>
+  Sequences scheduled for prefill. Each sequence must have an allocated
+  `block_table`.
+</ParamField>
+
+#### Return value
+
+<ResponseField name="input_ids" type="torch.Tensor">
+  1-D long tensor of concatenated (non-cached) token IDs, on the current CUDA device.
+</ResponseField>
+
+---
+
+### `prepare_decode`
+
+```python
+model_runner.prepare_decode(seqs: list[Sequence]) -> torch.Tensor
+```
+
+Builds input tensors for a decode step and stores them in the attention context via `set_context(is_prefill=False, ...)`:
+
+| Tensor | Description |
+|---|---|
+| `input_ids` | Last token of each sequence, shape `(batch_size,)` |
+| `slot_mapping` | KV cache slot for the new token in each sequence |
+| `context_lens` | Total token count for each sequence (for attention masking) |
+| `block_tables` | Per-sequence block ID table |
+
+<ParamField body="seqs" type="list[Sequence]" required>
+  Sequences scheduled for decode.
+</ParamField>
+
+#### Return value
+
+<ResponseField name="input_ids" type="torch.Tensor">
+  1-D long tensor of last-token IDs, shape `(batch_size,)`, on the current CUDA device.
+</ResponseField>
+
+---
+
+### `run_model`
+
+```python
+@torch.inference_mode()
+model_runner.run_model(input_ids: torch.Tensor, is_prefill: bool) -> torch.Tensor
+```
+
+Executes the model forward pass and returns the logit tensor.
+
+- **Prefill / eager mode**: calls `self.model(input_ids)` directly, then `model.compute_logits(hidden_states)`.
+- **Decode (CUDA graph)**: finds the smallest captured graph whose batch size `≥ len(seqs)`, copies the current tensors into the pre-allocated graph variables, replays the graph, and computes logits from `graph_vars["outputs"]`.
+
+<ParamField body="input_ids" type="torch.Tensor" required>
+  Token IDs prepared by `prepare_prefill` or `prepare_decode`.
+</ParamField>
+
+<ParamField body="is_prefill" type="bool" required>
+  `True` to use the eager path; `False` to use CUDA graph replay.
+</ParamField>
+
+#### Return value
+
+<ResponseField name="logits" type="torch.Tensor">
+  Logit tensor. Shape `(num_tokens, vocab_size)` for prefill;
+  `(batch_size, vocab_size)` for decode.
+</ResponseField>
+
+---
+
+### `run`
+
+```python
+model_runner.run(seqs: list[Sequence], is_prefill: bool) -> torch.Tensor | None
+```
+
+Main inference entry point. Calls `prepare_prefill` or `prepare_decode`, then `run_model`, then the sampler. Only rank 0 samples tokens; all other ranks return `None`.
+
+<ParamField body="seqs" type="list[Sequence]" required>
+  Sequences to process.
+</ParamField>
+
+<ParamField body="is_prefill" type="bool" required>
+  Whether to run a prefill or decode step.
+</ParamField>
+
+#### Return value
+
+<ResponseField name="token_ids" type="torch.Tensor | None">
+  1-D tensor of sampled token IDs on rank 0 (one per sequence). `None` on
+  worker ranks.
+</ResponseField>
+
+---
+
+### `capture_cudagraph`
+
+```python
+@torch.inference_mode()
+model_runner.capture_cudagraph() -> None
+```
+
+Pre-allocates tensors at maximum sizes and captures CUDA graphs for decode
+batch sizes `[1, 2, 4, 8]` plus every multiple of 16 up to `max_num_seqs`.
+
+At decode time `run_model` selects the smallest captured graph whose size is
+`≥ batch_size`, so the overhead of padding is minimised.
+
+Captured graphs are stored in `self.graphs` (dict mapping batch size → `CUDAGraph`) and input/output tensors are stored in `self.graph_vars`.
+
+<Note>
+CUDA graph capture is skipped when `config["enforce_eager"] = True`.
+</Note>
+
+**Captured batch sizes:**
+
+```python
+[1, 2, 4, 8] + list(range(16, max_num_seqs + 1, 16))
+```
+
+---
+
+### `call`
+
+```python
+model_runner.call(method_name: str, *args) -> Any
+```
+
+IPC dispatch method used by `LLMEngine` to invoke model operations.
+
+- On **rank 0**: serialises `(method_name, *args)` into shared memory via `write_shm()`, then executes the method locally.
+- On **all ranks**: looks up `method_name` on `self` and calls it with `args`.
+
+<ParamField body="method_name" type="str" required>
+  Name of the `ModelRunner` method to invoke (e.g. `"run"`, `"exit"`).
+</ParamField>
+
+<ParamField body="*args" type="Any">
+  Positional arguments forwarded to the method.
+</ParamField>
+
+---
+
+### `loop`
+
+```python
+model_runner.loop() -> None
+```
+
+Blocking event loop for worker ranks (`rank != 0`). Continuously reads IPC commands from shared memory via `read_shm()`, dispatches them via `call()`, and exits cleanly when `"exit"` is received.
+
+<Warning>
+This method asserts `world_size > 1` and `rank != 0`. It must not be called on the rank-0 process.
+</Warning>
+
+---
+
+### `exit`
+
+```python
+model_runner.exit() -> None
+```
+
+Cleans up GPU resources: closes and unlinks shared memory (rank 0 unlinks), deletes CUDA graphs, synchronises the device, and destroys the NCCL process group.
+
+---
+
+## CUDA graph batch sizes
+
+The table below shows which graphs are captured for a given `max_num_seqs`.
+
+| `max_num_seqs` | Captured batch sizes |
+|---|---|
+| 8 | 1, 2, 4, 8 |
+| 16 | 1, 2, 4, 8, 16 |
+| 32 | 1, 2, 4, 8, 16, 32 |
+| 64 | 1, 2, 4, 8, 16, 32, 48, 64 |
+
+At runtime the smallest graph `bs_ >= actual_batch_size` is replayed, so at most `bs_ - actual_batch_size` dummy tokens are computed.

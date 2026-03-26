@@ -1,0 +1,170 @@
+---
+title: "KV Cache"
+description: "How miniVLLM stores, retrieves, and reuses key-value tensors across decode steps using paged physical blocks and xxhash-based prefix caching."
+---
+
+The KV cache stores the key and value tensors produced by every transformer layer for every past token. Without it, autoregressive generation would recompute the entire context at every step. With it, each decode step processes only the single new token and reads the history from cache.
+
+## What the cache stores
+
+For each transformer layer and each token, the model computes a key vector and a value vector of shape `(num_kv_heads, head_dim)`. The KV cache holds these tensors so they can be retrieved on future steps without re-running the model on past tokens.
+
+## Cache layout
+
+The physical cache tensors are shaped:
+
+```
+(num_blocks, block_size, num_kv_heads, head_dim)
+```
+
+- `num_blocks` — total number of physical pages allocated at startup
+- `block_size` — number of token slots per block (e.g. 16)
+- `num_kv_heads` — number of key/value attention heads
+- `head_dim` — dimension of each head vector
+
+For a model with `num_kv_heads=8`, `head_dim=128`, `block_size=16`, and 1000 allocated blocks, each cache tensor (K or V) occupies `1000 × 16 × 8 × 128 × 2 bytes ≈ 32 MB`.
+
+## Writing to the cache: `store_kvcache`
+
+After every forward pass (both prefill and decode), the new K and V tensors are written into the cache. The `store_kvcache` function in `layers/attention.py` launches a Triton kernel with one thread per `(token, kv_head)` pair:
+
+```python
+def store_kvcache(
+    key: torch.Tensor,          # (num_tokens, num_kv_heads, head_dim)
+    value: torch.Tensor,        # (num_tokens, num_kv_heads, head_dim)
+    k_cache: torch.Tensor,      # (num_blocks, block_size, num_kv_heads, head_dim)
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor, # (num_tokens,) — physical slot for each token
+    block_size: int,
+):
+    grid = (num_tokens, num_kv_heads)
+    store_kvcache_kernel[grid](...)
+```
+
+### Slot mapping
+
+Each token in the current batch is assigned a **cache slot**: a flat integer index into the physical cache. The kernel converts a slot index into a `(block_idx, block_offset)` pair:
+
+```python
+# store_kvcache_kernel — attention.py
+token_idx   = tl.program_id(0)
+slot_idx    = tl.load(slot_mapping_ptr + token_idx)
+
+if slot_idx == -1:
+    return  # token was a prefix-cache hit, nothing to write
+
+block_idx    = slot_idx // block_size
+block_offset = slot_idx % block_size
+
+cache_offset = (block_idx   * block_size * num_kv_heads * head_dim
+              + block_offset * num_kv_heads * head_dim
+              + head_idx     * head_dim
+              + head_offsets)
+
+tl.store(k_cache_ptr + cache_offset, key)
+tl.store(v_cache_ptr + cache_offset, value)
+```
+
+Slot index `-1` is the sentinel for tokens whose KV values were already cached (prefix cache hit). The kernel silently skips those tokens.
+
+### Slot assignment during decode
+
+During each decode step, `model_runner.prepare_decode` computes the new slot for the token about to be written:
+
+```python
+new_slot = seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1
+```
+
+Because `BlockManager.append` guarantees a fresh block exists before the forward pass, this slot is always valid and never overlaps with an existing token.
+
+## Reading from the cache: paged attention decode
+
+During decode, the model reads the full KV history from the paged cache using the block table. Each thread follows the indirection:
+
+```
+logical token index → block_num, block_offset → physical_block_idx (via block_tables) → cache address
+```
+
+See [Paged Attention](/concepts/paged-attention) for the full kernel walkthrough.
+
+## Prefix caching
+
+When multiple requests share a common prefix (e.g., the same system prompt), the KV values for those tokens only need to be computed and stored once.
+
+### Content-based hashing
+
+`BlockManager.compute_hash` produces a context-sensitive fingerprint for each full block using `xxhash`:
+
+```python
+def compute_hash(self, token_ids: list[int], prefix_hash_value: int) -> int:
+    h = xxhash.xxh64()
+    if prefix_hash_value != -1:
+        # chain the previous block's hash so identical token_ids
+        # in different contexts produce different hashes
+        h.update(prefix_hash_value.to_bytes(8, 'little'))
+    h.update(np.array(token_ids, dtype=np.int32).tobytes())
+    return h.intdigest()
+```
+
+Chaining the prefix hash means two blocks with identical content but different preceding context are treated as distinct — preventing incorrect cache reuse.
+
+<Note>
+  Hashes are computed only for **full** blocks. The partial trailing block of an in-progress sequence always has `hash = -1` and is never shared.
+</Note>
+
+### Cache hit vs cache miss
+
+<Tabs>
+  <Tab title="Cache hit">
+    When a new sequence is allocated, `BlockManager.allocate` looks up each block's hash:
+
+    ```python
+    block_id = self.hash_to_block_id.get(h, -1)
+
+    if block_id != -1 and self.blocks[block_id].token_ids == token_ids:
+        # confirmed hit — reuse the block
+        seq.num_cached_tokens += self.block_size
+        block.ref_count += 1
+        seq.block_table.append(block_id)
+    ```
+
+    The existing physical block is added to the sequence's block table. The model runner skips writing new KV values for those tokens (their `slot_mapping` entries are set to `-1`).
+  </Tab>
+  <Tab title="Cache miss">
+    On a miss (hash not found, or token IDs differ due to hash collision), a fresh block is taken from `free_block_ids`:
+
+    ```python
+    block = self._allocate_block(self.free_block_ids[0])
+    block.update(h=h, token_ids=token_ids)
+    if h != -1:
+        self.hash_to_block_id[h] = block.block_id
+    seq.block_table.append(block.block_id)
+    ```
+
+    The block records the token IDs and hash so future sequences can hit it.
+  </Tab>
+</Tabs>
+
+## Block lifecycle
+
+<Steps>
+  <Step title="Allocation">
+    At startup, `ModelRunner.allocate_kv_cache` measures peak model memory (weights + activations) and allocates as many blocks as the remaining GPU memory allows. All blocks start in `free_block_ids`.
+  </Step>
+  <Step title="Prefix hit (optional)">
+    When a sequence is scheduled, full prefix blocks that match a cached hash are reused. Their reference counts are incremented. The sequence's `num_cached_tokens` reflects how many tokens do not need to be re-attended.
+  </Step>
+  <Step title="Active writes">
+    During prefill and each decode step, the Triton `store_kvcache` kernel writes K and V for uncached tokens into the assigned physical slots.
+  </Step>
+  <Step title="Block completion">
+    When a block fills up (`num_tokens % block_size == 0`), `BlockManager.append` records its hash so subsequent sequences can reuse it as a prefix.
+  </Step>
+  <Step title="Eviction">
+    When a sequence finishes or is preempted, `BlockManager.deallocate` decrements every block's `ref_count`. Blocks reaching zero are returned to `free_block_ids` immediately.
+  </Step>
+</Steps>
+
+<Tip>
+  The KV cache in miniVLLM is a flat GPU tensor allocated once at startup. There are no dynamic allocations during inference — all memory management is bookkeeping in the CPU-side `BlockManager`.
+</Tip>

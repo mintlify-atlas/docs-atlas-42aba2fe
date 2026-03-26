@@ -1,0 +1,100 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "miniVLLM",
+  "projectDescription": "A from-scratch, self-contained replication of the vLLM inference engine featuring custom paged attention and flash attention implementations in Triton, designed as both a production-quality library and a step-by-step educational resource.",
+  "theme": "luma",
+  "primaryColor": "#040404",
+  "lightColor": "#d4fb65",
+  "darkColor": "#33183b",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/paged-attention",
+              "concepts/flash-attention",
+              "concepts/kv-cache",
+              "concepts/scheduling"
+            ]
+          },
+          {
+            "group": "Architecture Guide",
+            "pages": [
+              "architecture/layers",
+              "architecture/models",
+              "architecture/engine",
+              "architecture/multi-gpu"
+            ]
+          },
+          {
+            "group": "Benchmarks",
+            "pages": [
+              "benchmarks/prefill",
+              "benchmarks/decoding",
+              "benchmarks/tps"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Engine",
+            "pages": [
+              "api/llm-engine",
+              "api/scheduler",
+              "api/model-runner",
+              "api/sampling-params"
+            ]
+          },
+          {
+            "group": "Layers & Models",
+            "pages": [
+              "api/attention",
+              "api/layers",
+              "api/models"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Self-contained Triton paged attention kernel for decode phase",
+    "Self-contained Triton flash attention kernel for prefill phase (O(N) memory)",
+    "Prefix caching via content-aware KV cache block hashing",
+    "Multi-GPU tensor parallelism with NCCL collective operations",
+    "CUDA graph capture for low-latency decode",
+    "Iteration-level scheduling with preemption support",
+    "Grouped Query Attention (GQA) support",
+    "Qwen3 and Llama 3.2 model implementations",
+    "Comprehensive benchmark suite comparing PyTorch, Triton, and Flash Attention"
+  ],
+  "publicApiSurface": [
+    "LLMEngine(config: dict)",
+    "LLMEngine.generate(prompts: list[str], sampling_params: SamplingParams) -> dict",
+    "LLMEngine.add_prompt(prompt: str, sampling_params: SamplingParams) -> None",
+    "LLMEngine.step() -> tuple[list, int, bool]",
+    "SamplingParams(temperature, max_tokens, ignore_eos, max_model_length)",
+    "Scheduler(max_num_sequences, max_num_batched_tokens, max_cached_blocks, block_size, eos)",
+    "ModelRunner(config, rank, event)",
+    "Attention(num_heads, head_dim, scale, num_kv_heads, block_size)",
+    "flash_attention_prefill(q, k, v, cu_seqlens, scale, num_heads, num_kv_heads, head_dim)",
+    "paged_attention_decode(query, k_cache, v_cache, block_tables, context_lens, scale, ...)",
+    "store_kvcache(key, value, k_cache, v_cache, slot_mapping, block_size)",
+    "BlockManager(num_blocks, block_size)",
+    "Sequence(token_ids, block_size, sampling_params)"
+  ]
+}

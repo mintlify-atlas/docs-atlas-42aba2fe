@@ -1,0 +1,180 @@
+---
+title: "Scheduler"
+description: "Token-level batch scheduler with paged KV cache management, prefix caching, and preemption support."
+---
+
+`Scheduler` decides which sequences to run on each forward pass and manages the allocation of KV cache blocks through `BlockManager`. It maintains two queues — **waiting** and **running** — and alternates between prefill batches (promoting sequences from waiting) and decode batches (stepping running sequences by one token).
+
+## Constructor
+
+```python
+Scheduler(
+    max_num_sequences: int,
+    max_num_batched_tokens: int,
+    max_cached_blocks: int,
+    block_size: int,
+    eos: int,
+)
+```
+
+<ParamField body="max_num_sequences" type="int" required>
+  Maximum number of sequences that can be scheduled in a single batch, whether
+  during prefill or decode.
+</ParamField>
+
+<ParamField body="max_num_batched_tokens" type="int" required>
+  Maximum total tokens across all sequences in one batch. Prefill counts the
+  full prompt length; decode counts one token per sequence.
+</ParamField>
+
+<ParamField body="max_cached_blocks" type="int" required>
+  Total number of KV cache blocks available in the pool. Passed directly to
+  `BlockManager`. At runtime this is overridden by `ModelRunner.allocate_kv_cache()`
+  to the actual GPU-measured value.
+</ParamField>
+
+<ParamField body="block_size" type="int" required>
+  Number of tokens per KV cache block. Must match the value used by
+  `ModelRunner`.
+</ParamField>
+
+<ParamField body="eos" type="int" required>
+  EOS token ID used to detect end-of-sequence during postprocessing.
+</ParamField>
+
+## Queue model
+
+The scheduler maintains two `deque` objects:
+
+- **`waiting`** — sequences that have been added but not yet allocated KV cache blocks.
+- **`running`** — sequences that own KV cache blocks and are actively being decoded.
+
+On each call to `schedule()`, the scheduler first tries to promote sequences from `waiting` to `running` (prefill). Only if no waiting sequence can be admitted does it then schedule a decode step over the sequences in `running`.
+
+## Methods
+
+### `add_sequence`
+
+```python
+scheduler.add_sequence(sequence: Sequence) -> None
+```
+
+Appends a `Sequence` object to the end of the **waiting** queue. Called by `LLMEngine.add_prompt()` after tokenization.
+
+<ParamField body="sequence" type="Sequence" required>
+  A fully constructed `Sequence` object. The sequence must already have its
+  token IDs and `SamplingParams` fields set.
+</ParamField>
+
+---
+
+### `schedule`
+
+```python
+scheduler.schedule() -> tuple[list[Sequence], bool]
+```
+
+Selects sequences for the next batch and returns them together with a flag indicating whether the batch is a prefill or a decode.
+
+**Prefill path** — iterates the `waiting` queue front-to-back:
+- Checks `BlockManager.can_allocate(seq)` and the `max_num_batched_tokens` / `max_num_sequences` limits.
+- Allocates KV blocks, sets `seq.status = RUNNING`, and moves the sequence to `running`.
+- Stops as soon as any limit is hit or the queue is empty.
+- Returns `(scheduled_sequences, True)` if any sequences were admitted.
+
+**Decode path** — only reached when no sequence was admitted from `waiting`:
+- Iterates the `running` queue and checks `BlockManager.can_append(seq)`.
+- If a running sequence cannot be appended (no free block for the next token), it is **preempted**: the least-recently-scheduled running sequence is moved back to `waiting`.
+- Stops when `max_num_batched_tokens` or `max_num_sequences` is reached.
+- Returns `(scheduled_sequences, False)`.
+
+#### Return value
+
+<ResponseField name="scheduled_sequences" type="list[Sequence]">
+  Sequences selected for this forward pass. Empty when both queues are empty.
+</ResponseField>
+
+<ResponseField name="is_prefill" type="bool">
+  `True` when the batch is a prefill pass; `False` for a decode pass.
+</ResponseField>
+
+---
+
+### `postprocess`
+
+```python
+scheduler.postprocess(seqs: list[Sequence], token_ids: list[int]) -> None
+```
+
+Called after `ModelRunner.run()` returns sampled token IDs. For each `(seq, token_id)` pair:
+1. Appends `token_id` to the sequence's token list.
+2. Evaluates the three stopping conditions below.
+3. If any condition is met, sets `seq.status = FINISHED`, deallocates its KV blocks, and removes it from the `running` queue.
+
+#### Stopping conditions
+
+| Condition | Triggered when |
+|---|---|
+| EOS token | `token_id == eos` and `seq.ignore_eos` is `False` |
+| Max completion tokens | `seq.num_completion_tokens >= seq.max_tokens` |
+| Max model length | `seq.max_model_length is not None` and `seq.num_tokens >= seq.max_model_length` |
+
+<ParamField body="seqs" type="list[Sequence]" required>
+  The same list returned by the preceding `schedule()` call.
+</ParamField>
+
+<ParamField body="token_ids" type="list[int]" required>
+  One sampled token ID per sequence, in the same order as `seqs`.
+</ParamField>
+
+---
+
+### `preempt`
+
+```python
+scheduler.preempt(seq: Sequence) -> None
+```
+
+Moves a running sequence back to the **front** of the waiting queue. Its KV cache blocks are deallocated so they can be used by other sequences. When the sequence is rescheduled later it will go through prefill again.
+
+<ParamField body="seq" type="Sequence" required>
+  A sequence currently in the `running` queue.
+</ParamField>
+
+---
+
+### `is_finished`
+
+```python
+scheduler.is_finished() -> bool
+```
+
+Returns `True` when both the `waiting` and `running` queues are empty, indicating that all submitted sequences have completed generation.
+
+---
+
+## Example
+
+```python
+from myvllm.engine.scheduler import Scheduler
+from myvllm.engine.sequence import Sequence
+from myvllm.sampling_parameters import SamplingParams
+
+scheduler = Scheduler(
+    max_num_sequences=8,
+    max_num_batched_tokens=512,
+    max_cached_blocks=256,
+    block_size=16,
+    eos=151645,
+)
+
+params = SamplingParams(temperature=0.7, max_tokens=32)
+seq = Sequence(token_ids=[1, 2, 3, 4], block_size=16, sampling_params=params)
+scheduler.add_sequence(seq)
+
+while not scheduler.is_finished():
+    scheduled, is_prefill = scheduler.schedule()
+    # ... run model and obtain token_ids ...
+    token_ids = [42] * len(scheduled)  # placeholder
+    scheduler.postprocess(scheduled, token_ids)
+```

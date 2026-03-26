@@ -1,0 +1,205 @@
+---
+title: "Scheduling"
+description: "How miniVLLM's iteration-level scheduler prioritizes prefill, manages running sequences, and preempts when GPU memory runs out."
+---
+
+The `Scheduler` in miniVLLM decides which sequences execute at every iteration. It manages two queues, enforces memory constraints via `BlockManager`, and ensures the system makes progress even when GPU memory is fully utilized.
+
+## The two queues
+
+```python
+class Scheduler:
+    def __init__(self, ...):
+        self.waiting: deque[Sequence] = deque()  # sequences not yet started
+        self.running: deque[Sequence] = deque()  # sequences actively generating
+```
+
+- **`waiting`** — holds new sequences that have been submitted but have not yet had blocks allocated. Sequences at the front of the deque have the highest priority for the next prefill slot.
+- **`running`** — holds sequences that have been prefilled at least once and are generating tokens one step at a time.
+
+## Scheduling priority: prefill before decode
+
+At every call to `schedule()`, the scheduler tries to move sequences from `waiting` into `running` **before** advancing any already-running sequences. This prefill-first policy maximizes throughput by keeping the GPU busy with new work rather than idle cycles.
+
+```python
+def schedule(self) -> tuple[list[Sequence], bool]:
+    scheduled_sequences = []
+    current_scheduled_tokens = 0
+
+    # Phase 1: try to admit new sequences (prefill)
+    while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
+        seq = self.waiting[0]
+        if (
+            self.block_manager.can_allocate(seq)
+            and len(seq) + current_scheduled_tokens <= self.max_num_batched_tokens
+        ):
+            seq = self.waiting.popleft()
+            self.block_manager.allocate(seq)
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)
+            scheduled_sequences.append(seq)
+            current_scheduled_tokens += len(seq)
+        else:
+            break
+
+    if scheduled_sequences:
+        return scheduled_sequences, True  # is_prefill=True
+
+    # Phase 2: advance running sequences (decode)
+    ...
+    return scheduled_sequences, False  # is_prefill=False
+```
+
+<Note>
+  `schedule()` returns a boolean `is_prefill` flag. The model runner uses this to choose between `flash_attention_prefill` and `paged_attention_decode`.
+</Note>
+
+## Prefill scheduling
+
+<Steps>
+  <Step title="Check block availability">
+    `block_manager.can_allocate(seq)` returns `True` when `len(free_block_ids) >= seq.num_blocks`. This guarantees all of the sequence's initial blocks can be reserved in one atomic step.
+  </Step>
+  <Step title="Check token budget">
+    The scheduler also tracks `current_scheduled_tokens`. Adding a new sequence must not push the total above `max_num_batched_tokens`, which caps the size of the prefill forward pass and prevents OOM on activations.
+  </Step>
+  <Step title="Allocate and transition">
+    If both checks pass: `allocate(seq)` is called (applying prefix caching), `seq.status` is set to `RUNNING`, and the sequence is appended to both `running` and the return list.
+  </Step>
+  <Step title="Stop on first failure">
+    The loop breaks as soon as the first waiting sequence cannot be admitted. Sequences are not reordered — the queue is strictly FIFO within each priority tier.
+  </Step>
+</Steps>
+
+## Decode scheduling
+
+If no sequences were admitted in the prefill phase, the scheduler advances currently running sequences:
+
+```python
+while self.running:
+    seq = self.running.popleft()
+
+    if not self.block_manager.can_append(seq):
+        # no room for this token — preempt
+        if self.running:
+            self.running.appendleft(seq)      # put it back
+            self.preempt(self.running.pop())  # preempt the last (lowest-priority) sequence
+        else:
+            self.preempt(seq)
+            break
+    else:
+        if (
+            current_scheduled_tokens >= self.max_num_batched_tokens
+            or len(scheduled_sequences) >= self.max_num_sequences
+        ):
+            self.running.appendleft(seq)  # defer to next iteration
+            break
+
+        self.block_manager.append(seq)  # reserve next block if needed
+        scheduled_sequences.append(seq)
+        current_scheduled_tokens += 1   # one token per decode step
+
+# restore scheduled sequences to front of running queue
+if scheduled_sequences:
+    self.running.extendleft(reversed(scheduled_sequences))
+```
+
+Each sequence contributes exactly one token to the decode batch.
+
+## Preemption
+
+When a running sequence needs a new block but no free blocks remain, the scheduler **preempts** the lowest-priority sequence (the tail of `running`) to reclaim its blocks:
+
+```python
+def preempt(self, seq: Sequence) -> None:
+    self.block_manager.deallocate(seq)     # free all its physical blocks
+    seq.status = SequenceStatus.WAITING
+    self.waiting.appendleft(seq)           # return to front of waiting queue
+```
+
+The preempted sequence loses its allocated blocks but retains its token IDs. When it is next scheduled, `allocate` will re-run, potentially recovering prefix-cached blocks for free.
+
+<Note>
+  miniVLLM uses **swap-to-CPU preemption** semantics — the sequence is returned to the waiting queue and must go through prefill again. Production vLLM also supports swapping KV blocks to CPU memory, but miniVLLM omits this for simplicity.
+</Note>
+
+## Postprocessing
+
+After the model produces a new token for each running sequence, `postprocess` appends the token and checks stopping conditions:
+
+```python
+def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> None:
+    for seq, token_id in zip(seqs, token_ids):
+        seq.append_token(token_id)
+
+        stop_due_to_eos        = not seq.ignore_eos and token_id == self.eos
+        stop_due_to_max_tokens = seq.num_completion_tokens >= seq.max_tokens
+        stop_due_to_max_length = (
+            seq.max_model_length is not None
+            and seq.num_tokens >= seq.max_model_length
+        )
+
+        if stop_due_to_eos or stop_due_to_max_tokens or stop_due_to_max_length:
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
+            self.running.remove(seq)
+```
+
+<AccordionGroup>
+  <Accordion title="EOS token">
+    The model emitted the end-of-sequence token. Stopped unless `sampling_params.ignore_eos=True`.
+  </Accordion>
+  <Accordion title="max_tokens">
+    The number of generated (completion) tokens reached `sampling_params.max_tokens`. The prompt tokens are not counted.
+  </Accordion>
+  <Accordion title="max_model_length">
+    The total token count (prompt + completion) reached `sampling_params.max_model_length`. Useful for enforcing context-window limits.
+  </Accordion>
+</AccordionGroup>
+
+## Interaction with BlockManager
+
+```
+Scheduler.schedule()
+    │
+    ├─ can_allocate(seq)  ─→  BlockManager: check free_block_ids count
+    ├─ allocate(seq)      ─→  BlockManager: assign physical blocks, apply prefix cache
+    ├─ can_append(seq)    ─→  BlockManager: check if next token needs a new block
+    ├─ append(seq)        ─→  BlockManager: allocate new block if num_tokens % block_size == 1
+    └─ (on preempt/finish) deallocate(seq) ─→  BlockManager: decrement ref counts, free blocks
+```
+
+The `BlockManager` is a pure bookkeeping object — it maintains the `free_block_ids` deque and `hash_to_block_id` dict but does not touch GPU memory directly. The actual KV tensors are read and written by the Triton kernels in `layers/attention.py`.
+
+## Full `schedule()` flow
+
+```
+call schedule()
+│
+├─ PREFILL PHASE
+│   while waiting is not empty:
+│     peek at waiting[0]
+│     if can_allocate AND token budget allows:
+│       popleft from waiting
+│       allocate blocks (with prefix caching)
+│       set status = RUNNING
+│       add to running + scheduled_sequences
+│     else: break
+│
+│   if any sequences were scheduled:
+│     return (sequences, is_prefill=True)
+│
+└─ DECODE PHASE
+    while running is not empty:
+      popleft from running
+      if not can_append:
+        preempt tail of running queue
+      elif over budget:
+        push back to front; break
+      else:
+        call append (reserve block if needed)
+        add to scheduled_sequences
+    
+    restore scheduled_sequences to front of running
+    return (sequences, is_prefill=False)
+```

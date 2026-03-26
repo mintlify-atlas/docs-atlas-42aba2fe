@@ -1,80 +1,234 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quick start"
+description: "Run your first miniVLLM inference in under five minutes."
 ---
 
-## Get started in three steps
+## Prerequisites
 
-Get your documentation site running locally and make your first customization.
+Before you begin, confirm that you have:
 
-### Step 1: Set up your local environment
+- **Python 3.11** (exactly — `>=3.11, <3.12` is required)
+- A **CUDA-capable GPU** (required for Triton kernels and torch CUDA ops)
+- **Git** to clone the repository
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+## Installation
 
-### Step 2: Deploy your changes
+<Steps>
+  <Step title="Install uv">
+    miniVLLM uses [uv](https://github.com/astral-sh/uv) for dependency management. Install it with:
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```bash
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    ```
+  </Step>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/Wenyueh/MinivLLM.git
+    cd MinivLLM
+    ```
+  </Step>
+  <Step title="Sync dependencies">
+    ```bash
+    uv sync
+    ```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    `uv sync` reads `pyproject.toml` and installs all dependencies into an isolated virtual environment. No manual `pip install` is needed.
+  </Step>
+</Steps>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+## Run the inference demo
 
-### Step 3: Go live
+The main demo runs end-to-end inference through the custom engine:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+```bash
+uv run python main.py
+```
 
-## Next steps
+This script:
 
-Now that you have your docs running, explore these key features:
+1. Loads the `Qwen/Qwen3-0.6B` tokenizer
+2. Initializes `LLMEngine` with a small Qwen3 model (random weights for speed)
+3. Creates chat prompts and tokenizes them using the model's chat template
+4. Processes them through the engine using paged attention and KV cache management
+5. Generates up to 256 new tokens per prompt with temperature sampling
+6. Prints each prompt alongside its completion
 
-<CardGroup cols={2}>
+### Configuration
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+The demo is configured by the `config` dict at the top of `main.py`. The engine requires both scheduling/memory keys and model architecture keys:
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+```python
+config = {
+    # Scheduling and memory
+    "model_name_or_path": "Qwen/Qwen3-0.6B",
+    "world_size": 1,
+    "max_num_sequences": 16,
+    "max_num_batched_tokens": 1024,
+    "max_cached_blocks": 1024,
+    "block_size": 256,
+    "eos": 151645,
+    "enforce_eager": True,
+    "gpu_memory_utilization": 0.9,
+    "max_num_batch_tokens": 4096,   # warmup batch size
+    "max_model_length": 128,        # max total tokens (prompt + completion)
+    # Qwen3-0.6B model architecture
+    "vocab_size": 151936,
+    "hidden_size": 1024,
+    "num_heads": 16,
+    "head_dim": 128,
+    "num_kv_heads": 8,
+    "intermediate_size": 3072,
+    "num_layers": 28,
+    "tie_word_embeddings": True,
+    "base": 1000000,
+    "rms_norm_epsilon": 1e-6,
+    "qkv_bias": False,
+    "scale": 1,
+    "max_position": 32768,
+    "ffn_bias": False,
+}
+```
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+| Key | Description |
+|---|---|
+| `world_size` | Number of GPUs. Set to `n` for tensor parallelism across `n` GPUs. |
+| `max_num_sequences` | Maximum sequences scheduled in one iteration. |
+| `max_num_batched_tokens` | Maximum total tokens in a single forward pass (scheduler). |
+| `max_num_batch_tokens` | Maximum tokens in the warmup dry-run (model runner). |
+| `max_cached_blocks` | KV cache block pool hint; overridden by measured GPU memory at runtime. |
+| `block_size` | Tokens per KV cache block. |
+| `eos` | End-of-sequence token ID. For Qwen3-0.6B: `151645`. |
+| `enforce_eager` | Disable CUDA graph capture when `True` (safer for debugging). |
+| `gpu_memory_utilization` | Fraction of free GPU memory reserved for the KV cache pool. |
+| `max_model_length` | Maximum total sequence length (prompt + completion tokens). |
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+### Multi-GPU setup
 
-</CardGroup>
+To run with multiple GPUs, set `world_size` in the `config` dict to the number of GPUs you want to use:
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+```python
+config = {
+    ...
+    "world_size": 2,  # use 2 GPUs
+    ...
+}
+```
+
+The engine uses tensor parallelism and spawns one worker process per additional GPU rank.
+
+## Run benchmarks
+
+<CodeGroup>
+
+```bash Prefill benchmark
+uv run python benchmark_prefilling.py
+```
+
+```bash Decode benchmark
+uv run python benchmark_decoding.py
+```
+
+</CodeGroup>
+
+The **prefill benchmark** compares three attention implementations during the prompt-processing phase:
+
+1. PyTorch standard attention (O(N²) memory)
+2. Naive Triton kernel (O(N²) memory, limited to ≤128 tokens)
+3. Flash attention Triton kernel (O(N) memory)
+
+The **decode benchmark** compares three paged attention implementations during token generation:
+
+1. Naive PyTorch loop over paged KV cache
+2. Optimized PyTorch with vectorized gathering and masking
+3. Custom Triton paged attention kernel
+
+## Use the API directly
+
+You can use `LLMEngine` and `SamplingParams` directly in your own scripts:
+
+```python
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(".") / "src"))
+
+from myvllm.engine.llm_engine import LLMEngine
+from myvllm.sampling_parameters import SamplingParams
+from transformers import AutoTokenizer
+
+config = {
+    "model_name_or_path": "Qwen/Qwen3-0.6B",
+    "world_size": 1,
+    "max_num_sequences": 16,
+    "max_num_batched_tokens": 1024,
+    "max_cached_blocks": 1024,
+    "block_size": 256,
+    "eos": 151645,
+    "enforce_eager": True,
+    "gpu_memory_utilization": 0.9,
+    "max_num_batch_tokens": 4096,
+    "max_model_length": 128,
+    # Qwen3-0.6B architecture
+    "vocab_size": 151936,
+    "hidden_size": 1024,
+    "num_heads": 16,
+    "head_dim": 128,
+    "num_kv_heads": 8,
+    "intermediate_size": 3072,
+    "num_layers": 28,
+    "tie_word_embeddings": True,
+    "base": 1000000,
+    "rms_norm_epsilon": 1e-6,
+    "qkv_bias": False,
+    "scale": 1,
+    "max_position": 32768,
+    "ffn_bias": False,
+}
+
+tokenizer = AutoTokenizer.from_pretrained(config["model_name_or_path"])
+llm = LLMEngine(config=config)
+
+sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=128)
+
+prompts = ["introduce yourself", "list all prime numbers within 100"]
+prompts = [
+    tokenizer.apply_chat_template(
+        [{"role": "user", "content": p}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    for p in prompts
+]
+
+outputs = llm.generate(prompts, sampling_params)
+
+for prompt, text in zip(prompts, outputs["text"]):
+    print(f"Prompt: {prompt}")
+    print(f"Completion: {text}\n")
+```
+
+### SamplingParams fields
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `temperature` | `float` | `1.0` | Sampling temperature. Must be > 0 (greedy decoding is not supported). |
+| `max_tokens` | `int` | `64` | Maximum number of tokens to generate (completion tokens only). |
+| `max_model_length` | `int \| None` | `None` | Maximum total sequence length (prompt + completion). |
+| `ignore_eos` | `bool` | `False` | Continue generating past the EOS token. |
+
+## Understanding the output
+
+During a `generate()` call, the engine prints throughput statistics for each scheduling step:
+
+```
+1024 number of processed tokens 18432.5 tokens/sec during prefilling
+16 number of processed tokens 312.7 tokens/sec during decoding
+```
+
+- **Prefilling** processes all input prompt tokens in parallel — throughput is high.
+- **Decoding** generates one token per active sequence per step — throughput reflects the cost of paged attention over the growing KV cache.
+
+The final `outputs` dict contains:
+
+- `outputs["text"]` — list of decoded completion strings, one per prompt
+- `outputs["token_ids"]` — list of token ID lists for each completion

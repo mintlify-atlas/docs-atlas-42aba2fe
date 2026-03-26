@@ -1,0 +1,426 @@
+---
+title: "Neural Network Layers"
+description: "The primitive building blocks in myvllm/layers: activation, normalization, tensor-parallel linear, embeddings, attention, positional encoding, and sampling."
+---
+
+Every model in miniVLLM is assembled from a small set of reusable layers defined in `myvllm/layers/`. Each layer owns its weight-loading logic so the same code works on one GPU or many.
+
+## Layer overview
+
+<CardGroup cols={2}>
+  <Card title="SiluAndMul" icon="bolt">
+    Gated SiLU activation used in every MLP block.
+  </Card>
+  <Card title="LayerNorm" icon="sliders">
+    RMSNorm with optional fused residual addition.
+  </Card>
+  <Card title="Linear layers" icon="table">
+    Four parallel variants that shard weights across GPUs.
+  </Card>
+  <Card title="VocabParallelEmbedding / ParallelLMHead" icon="book">
+    Vocabulary sharded across GPUs with tied-weight support.
+  </Card>
+  <Card title="Attention" icon="eye">
+    Routes to flash attention (prefill) or paged attention (decode).
+  </Card>
+  <Card title="RotaryEmbedding" icon="rotate-cw">
+    RoPE with Llama 3 NTK/YARN long-context scaling.
+  </Card>
+  <Card title="SamplerLayer" icon="dice">
+    Temperature-scaled multinomial sampling via Gumbel trick.
+  </Card>
+</CardGroup>
+
+---
+
+## SiluAndMul
+
+**File:** `myvllm/layers/activation.py`
+
+Used in every MLP block as the gated activation function. The input tensor is split in half along the last dimension: the first half is passed through SiLU, and the result is multiplied element-wise by the second half.
+
+```python
+class SiluAndMul(nn.Module):
+    @torch.compile
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, y = x.chunk(2, -1)
+        return F.silu(x) * y
+```
+
+The gate mechanism lets the network learn to suppress or amplify features without an extra linear projection. `@torch.compile` fuses the two operations into a single CUDA kernel, which improves throughput for large tensors.
+
+<Tip>
+  `torch.compile` is most beneficial for large batch sizes. At small scales (e.g. `(400, 800)`) the compilation overhead can outweigh the savings.
+</Tip>
+
+---
+
+## LayerNorm (RMSNorm)
+
+**File:** `myvllm/layers/layernorm.py`
+
+MiniVLLM uses Root Mean Square normalization — the mean-centering step of standard LayerNorm is skipped, reducing compute by ~30% with no measurable quality loss for large models.
+
+```python
+class LayerNorm(torch.nn.Module):
+    def __init__(self, gamma: torch.Tensor, eps: float = 1e-5):
+        super().__init__()
+        self.weight = torch.nn.Parameter(gamma.detach().clone())
+        self.eps = eps
+
+    @torch.compile
+    def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
+        # RMSNorm(x) = (x / sqrt(mean(x²) + ε)) ⊙ γ
+        variance = x.pow(2).mean(dim=-1, keepdim=True) + self.eps
+        x_norm = (x / variance.sqrt() * self.weight)
+        return x_norm
+
+    def residual_rms_forward(
+        self, x: torch.Tensor, residual: torch.Tensor
+    ) -> torch.Tensor:
+        x = x + residual
+        return self.rms_forward(x), x
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if residual is not None:
+            return self.residual_rms_forward(x, residual)
+        return self.rms_forward(x)
+```
+
+**Residual fusion.** When `residual` is provided, the layer adds the residual *before* normalizing and returns the pre-norm sum as the new residual. This fuses the residual connection into the norm op, saving a separate addition kernel at each decoder layer.
+
+```python
+# decoder layer pattern
+x, residual = self.input_layernorm(x, residual)
+x = self.self_attn(x, positions)
+x, residual = self.post_attention_layernorm(x, residual)
+x = self.mlp(x)
+```
+
+---
+
+## Linear layers
+
+**File:** `myvllm/layers/linear.py`
+
+All linear layers inherit from `LinearBase`, which attaches a `weight_loader` callable to every `nn.Parameter`. When loading a checkpoint, the engine calls this loader instead of copying the full weight, letting each GPU extract only its shard.
+
+```python
+# Generic checkpoint loading loop
+for name, param in model.named_parameters():
+    if name in checkpoint:
+        loaded_weight = checkpoint[name]  # full weight, e.g. (4096, 4096)
+        if hasattr(param, 'weight_loader'):
+            param.weight_loader(param, loaded_weight)
+        else:
+            param.data.copy_(loaded_weight)
+```
+
+<AccordionGroup>
+  <Accordion title="ColumnParallelLinear — split output features">
+    Splits the output dimension (`dim=0` of the weight matrix) evenly across `tp_size` GPUs. Each GPU computes a partial output independently — no communication is needed during the forward pass.
+
+    ```python
+    class ColumnParallelLinear(LinearBase):
+        def __init__(self, input_size: int, output_size: int, bias: bool = True):
+            tp_size = dist.get_world_size()
+            # Each GPU stores output_size // tp_size rows
+            super().__init__(input_size, output_size // tp_size, bias, tp_dim=0)
+
+        def weight_loader(self, param, loaded_weights):
+            shard_size = loaded_weights.size(0) // self.tp_size
+            start = self.tp_rank * shard_size
+            param.data.copy_(loaded_weights.narrow(0, start, shard_size))
+
+        def forward(self, x):
+            return nn.functional.linear(x, self.weight, self.bias)
+    ```
+
+    Used for Q, K, V projections and MLP gate/up projections.
+  </Accordion>
+
+  <Accordion title="RowParallelLinear — split input features">
+    Splits the input dimension (`dim=1` of the weight matrix) across GPUs. Each GPU holds a column slice of the weight. Because each GPU only computes a partial dot product, a `dist.all_reduce` is required to sum the partial results after the matrix multiply.
+
+    ```python
+    class RowParallelLinear(LinearBase):
+        def __init__(self, input_size: int, output_size: int, bias: bool = True):
+            tp_size = dist.get_world_size()
+            super().__init__(input_size // tp_size, output_size, bias, tp_dim=1)
+
+        def forward(self, x):
+            result = nn.functional.linear(x, self.weight, self.bias)
+            if self.tp_size > 1:
+                dist.all_reduce(result, op=dist.ReduceOp.SUM)
+            return result
+    ```
+
+    Always paired with a preceding `ColumnParallelLinear`: the column-parallel layer shards the output, which becomes the sharded input consumed by the row-parallel layer.
+  </Accordion>
+
+  <Accordion title="MergedColumnParallelLinear — gate + up in one tensor">
+    Extends `ColumnParallelLinear` to hold two or more sub-matrices stacked along `dim=0`. This matches the checkpoint layout where `gate_proj.weight` and `up_proj.weight` are stored separately but the model stores them as a single merged tensor.
+
+    ```python
+    class MergedColumnParallelLinear(ColumnParallelLinear):
+        def __init__(
+            self,
+            input_size: int,
+            output_sizes: list[int],  # e.g. [intermediate_size, intermediate_size]
+            bias: bool = True,
+        ):
+            self.output_sizes = output_sizes
+            super().__init__(input_size, sum(output_sizes), bias)
+
+        def weight_loader(
+            self, param, loaded_weights, loaded_weight_id: int
+        ):
+            # offset into merged param for this sub-matrix
+            offset = sum(self.output_sizes[:loaded_weight_id]) // self.tp_size
+            shard_size = self.output_sizes[loaded_weight_id] // self.tp_size
+            param.data.narrow(0, offset, shard_size).copy_(
+                loaded_weights.narrow(0, self.tp_rank * shard_size, shard_size)
+            )
+    ```
+
+    `loaded_weight_id=0` loads the gate projection, `loaded_weight_id=1` loads the up projection.
+  </Accordion>
+
+  <Accordion title="QKVColumnParallelLinear — complete attention heads per GPU">
+    A specialized column-parallel layer for Q, K, V projections in attention. Unlike a generic column split, this class ensures that each GPU owns *complete* attention heads (not fractional ones), which is required for grouped-query attention (GQA).
+
+    ```python
+    class QKVColumnParallelLinear(ColumnParallelLinear):
+        def __init__(
+            self,
+            input_size: int,
+            head_size: int,
+            num_heads: int,
+            num_kv_heads: int | None = None,
+            bias: bool = False,
+        ):
+            self.num_heads = num_heads // self.tp_size
+            self.num_kv_heads = num_kv_heads // self.tp_size
+            total_output_size = head_size * (num_heads + 2 * num_kv_heads)
+            super().__init__(input_size, total_output_size, bias=bias)
+
+        def weight_loader(
+            self, param, loaded_weights, load_weight_id: str  # 'q', 'k', or 'v'
+        ):
+            ...
+    ```
+
+    The `weight_loader` accepts `load_weight_id` as `'q'`, `'k'`, or `'v'` and computes the correct offset within the merged QKV parameter.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## VocabParallelEmbedding and ParallelLMHead
+
+**File:** `myvllm/layers/embedding_head.py`
+
+The vocabulary is partitioned across GPUs along `dim=0` (the token dimension, not the embedding dimension). Each GPU stores `vocab_size // tp_size` embedding rows.
+
+```python
+class VocabParallelEmbedding(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        self.num_embeddings_per_partition = padded_vocab // tp_size
+        self.weight = nn.Parameter(
+            torch.empty(self.num_embeddings_per_partition, embedding_dim)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Mask tokens that belong to this GPU's partition
+        mask = (x >= self.tp_rank * self.num_embeddings_per_partition) & \
+               (x < (self.tp_rank + 1) * self.num_embeddings_per_partition) & \
+               (x < self.num_embeddings)
+        x = mask * (x - self.tp_rank * self.num_embeddings_per_partition)
+        output = F.embedding(x, self.weight)
+        if dist.get_world_size() > 1:
+            output = mask.unsqueeze(1) * output  # zero out-of-range embeddings
+            dist.all_reduce(output, op=dist.ReduceOp.SUM)
+        return output
+```
+
+`ParallelLMHead` extends `VocabParallelEmbedding` and is used as the output projection. During prefill it selects only the last token of each sequence before computing logits, then gathers partial logits from all GPUs to rank 0.
+
+```python
+class ParallelLMHead(VocabParallelEmbedding):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if context.is_prefill:
+            last_token = context.cu_seqlens_q[1:] - 1
+            x = x[last_token].contiguous()
+        logits = F.linear(x, self.weight)  # (batch, vocab_per_partition)
+        if self.tp_size > 1:
+            # Only rank 0 receives the full logit tensor
+            dist.gather(logits, gather_list=all_logits, dst=0)
+            if self.tp_rank == 0:
+                logits = torch.cat(all_logits, dim=-1)[..., :self.num_embeddings]
+        return logits
+```
+
+<Note>
+  Weight tying (`lm_head.weight = embed_tokens.weight`) is supported and halves the memory consumed by vocabulary parameters.
+</Note>
+
+---
+
+## Attention
+
+**File:** `myvllm/layers/attention.py`
+
+The `Attention` module dispatches to one of two Triton kernels depending on the inference phase:
+
+<Tabs>
+  <Tab title="Prefill — flash_attention_prefill">
+    For the prefill phase, all input tokens from all sequences are concatenated into a single flat tensor. The Triton kernel handles variable-length sequences via `cu_seqlens` (cumulative sequence lengths).
+
+    ```python
+    def flash_attention_prefill(
+        q: torch.Tensor,      # (total_tokens, num_heads, head_dim)
+        k: torch.Tensor,      # (total_tokens, num_kv_heads, head_dim)
+        v: torch.Tensor,      # (total_tokens, num_kv_heads, head_dim)
+        cu_seqlens: torch.Tensor,  # e.g. [0, 5, 8, 12]
+        scale: float,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> torch.Tensor: ...
+    ```
+
+    The kernel implements online softmax in blocks (Flash Attention style) with a causal mask applied within each sequence boundary.
+  </Tab>
+  <Tab title="Decode — paged_attention_decode">
+    For the decode phase, each sequence generates exactly one new token. Keys and values live in a paged KV cache: a pool of fixed-size blocks where each block stores `block_size` tokens.
+
+    ```python
+    def paged_attention_decode(
+        query: torch.Tensor,       # (batch_size, num_heads, head_dim)
+        k_cache: torch.Tensor,     # (num_blocks, block_size, num_kv_heads, head_dim)
+        v_cache: torch.Tensor,     # (num_blocks, block_size, num_kv_heads, head_dim)
+        block_tables: torch.Tensor, # (batch_size, max_num_blocks)
+        context_lens: torch.Tensor, # (batch_size,)
+        scale: float,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        block_size: int,
+    ) -> torch.Tensor: ...
+    ```
+
+    `block_tables` maps logical token positions to physical cache blocks. The kernel looks up each block at runtime, enabling non-contiguous KV cache allocation (PagedAttention).
+  </Tab>
+</Tabs>
+
+The `Attention.forward` method stores newly computed K and V into the cache before choosing which kernel to call:
+
+```python
+class Attention(nn.Module):
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        scale: float = 1.0,
+        num_kv_heads: int = None,
+        block_size: int = 16,
+    ): ...
+
+    def forward(self, q, k, v):
+        context = get_context()
+        # 1. Write k, v into the paged cache
+        store_kvcache(k, v, self.k_cache, self.v_cache, context.slot_mapping, ...)
+        # 2. Route to the appropriate kernel
+        if context.is_prefill:
+            return flash_attention_prefill(...)
+        else:
+            return paged_attention_decode(...)
+```
+
+---
+
+## RotaryEmbedding
+
+**File:** `myvllm/layers/rotary_embedding.py`
+
+Rotary Position Embedding (RoPE) encodes token positions by rotating query and key vectors in the complex plane. The frequency spectrum spans from high frequency (captures local relationships) to low frequency (captures long-range relationships).
+
+```python
+class RotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        base: int,                   # frequency base, e.g. 10000 (Qwen3) or 500000 (Llama 3)
+        rotary_embedding: int,       # number of dimensions to rotate (= head_dim)
+        max_position: int = 2048,
+        is_llama3: bool = False,
+        # Llama 3 NTK scaling parameters
+        llama3_rope_factor: float = 32.0,
+        llama3_rope_high_freq_factor: float = 4.0,
+        llama3_rope_low_freq_factor: float = 1.0,
+        llama3_rope_original_max_position_embeddings: int = 8192,
+    ): ...
+
+    @torch.compile
+    def forward(self, positions, query, key):
+        cos_sin = self.cos_sin_cache[positions]   # (seq_len, rotary_embedding)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        return apply_rotary_pos_emb(query, cos, sin), apply_rotary_pos_emb(key, cos, sin)
+```
+
+Cosine and sine tables are precomputed for all positions up to `max_position` and stored as a buffer (`cos_sin_cache`). At inference time only a lookup is needed.
+
+**Llama 3 NTK scaling.** When `is_llama3=True`, inverse frequencies are adjusted before building the cache:
+
+- High-frequency dimensions (short wavelength) are left unchanged — the model has seen many full cycles during training and can extrapolate.
+- Low-frequency dimensions (long wavelength) are divided by `llama3_rope_factor` — the model has never seen a full cycle for these, so the position is compressed back into the training distribution.
+- A smooth interpolation (`smooth` factor clamped to `[0, 1]`) is applied between the two regimes.
+
+---
+
+## SamplerLayer
+
+**File:** `myvllm/layers/sampler.py`
+
+Sampling converts raw logits into discrete token IDs. MiniVLLM uses the Gumbel-max trick, which is mathematically equivalent to sampling from the softmax distribution but avoids the need for an explicit `torch.multinomial` call.
+
+```python
+class SamplerLayer(nn.Module):
+    @torch.compile
+    def forward(
+        self, logits: torch.Tensor, temperature: torch.Tensor
+    ) -> torch.Tensor:
+        logits /= temperature.unsqueeze(-1)   # scale by per-sequence temperature
+        probs = torch.softmax(logits, dim=-1)
+        # Gumbel-max: divide probs by Exp(1) noise, take argmax
+        sample_tokens = probs.div_(
+            torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
+        ).argmax(dim=-1)
+        return sample_tokens
+```
+
+Temperature is a per-sequence scalar tensor, so different requests in the same batch can use different sampling temperatures.
+
+<Note>
+  `SamplerLayer` is called only on rank 0 (the scheduler rank). Worker GPUs compute the model forward pass but do not sample.
+</Note>
+
+---
+
+## The weight_loader pattern
+
+Every `nn.Parameter` created by the parallel layer classes has a `weight_loader` attribute attached at construction time. The checkpoint loader in `myvllm/utils/loader.py` checks for this attribute before copying weights:
+
+```python
+for name, param in model.named_parameters():
+    if name in checkpoint:
+        loaded_weight = checkpoint[name]
+        if hasattr(param, 'weight_loader'):
+            # Layer extracts the correct shard for this GPU
+            param.weight_loader(param, loaded_weight)
+        else:
+            param.data.copy_(loaded_weight)
+```
+
+This design means the model definition and the sharding logic are co-located. Adding a new parallel layer only requires implementing `weight_loader` — the loading loop is unchanged.
